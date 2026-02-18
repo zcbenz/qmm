@@ -385,21 +385,19 @@ int main(int argc, char** argv)
   CUTE_CHECK_ERROR(cudaSetDevice(0));
   cudaDeviceProp device_prop;
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
-  bool is_sm80 = device_prop.major >= 8;
+  // bool is_sm80 = device_prop.major >= 8;
 
   thrust::host_vector<TA> h_A(m*k*l);
   thrust::host_vector<TB> h_B(n*k*l);
   thrust::host_vector<TC> h_C(m*n*l);
 
-  for (int j = 0; j < h_A.size(); ++j) h_A[j] = static_cast<TA>(2*(rand() / double(RAND_MAX)) - 1);
-  for (int j = 0; j < h_B.size(); ++j) h_B[j] = static_cast<TB>(2*(rand() / double(RAND_MAX)) - 1);
+  for (int j = 0; j < h_A.size(); ++j) h_A[j] = static_cast<TA>(2*(rand() / double(RAND_MAX)) - 1) / 5;
+  for (int j = 0; j < h_B.size(); ++j) h_B[j] = static_cast<TB>(2*(rand() / double(RAND_MAX)) - 1) / 5;
   for (int j = 0; j < h_C.size(); ++j) h_C[j] = static_cast<TC>(-1);
 
   thrust::device_vector<TA> d_A = h_A;
   thrust::device_vector<TB> d_B = h_B;
   thrust::device_vector<TC> d_C = h_C;
-
-  double gflops = (2.0*m*n*k) * 1e-9;
 
   int ldA = 0, ldB = 0, ldC = n;
 
@@ -450,15 +448,11 @@ int main(int argc, char** argv)
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cute_gemm::qmm(
-        m, n, k, l, cute::Int<group_size>{},
-        d_A.data().get(),
-        d_B.data().get(),
-        d_S.data().get(),
-        d_Z.data().get(),
-        d_C.data().get(),
-        is_sm80,
-        launch_kernel);
+    gemm(transA, transB,
+        m, n, k, l,
+        d_A.data().get(), ldA,
+        d_B.data().get(), ldB,
+        d_C.data().get(), ldC);
   }
   double cute_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
@@ -466,12 +460,11 @@ int main(int argc, char** argv)
 
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cublas_gemm(
-        'T', 'N',
-        m, n, k, l,
-        d_A.data().get(),
-        d_B_ref.data().get(),
-        d_C.data().get());
+    cublas_gemm(transA, transB,
+                m, n, k, l,
+                d_A.data().get(),
+                d_B.data().get(),
+                d_C.data().get());
   }
   double cublas_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
