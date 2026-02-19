@@ -259,11 +259,11 @@ void qmm(
       dim3 num_blocks(size(ceil_div(m, bM)), size(ceil_div(n, bN)), l);
       dim3 block_dims(size(mma));
       void* args[] = {
-        &prob_shape, &cta_tiler,
-        &A, &dA, &sA_layout, &copy_a,
-        &B, &dB, &sB_layout, &copy_b,
-        &S, &Z, &S_layout,
-        &C, &dC, &mma};
+          &prob_shape, &cta_tiler,
+          &A, &dA, &sA_layout, &copy_a,
+          &B, &dB, &sB_layout, &copy_b,
+          &S, &Z, &S_layout,
+          &C, &dC, &mma};
       launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, 0, args);
     });
   });
