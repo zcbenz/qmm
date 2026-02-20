@@ -260,33 +260,42 @@ gemm_tn(int m, int n, int k, int l,
   auto swizzle_ab = composition(Swizzle<3,3,3>{},
                                 Layout<Shape <_8,Shape <_8, _8>>,
                                        Stride<_8,Stride<_1,_64>>>{});
-  auto bP = Int<3>{}; // pipeline
+  auto bP = Int<5>{}; // pipeline
   auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM,bK,bP));
   auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN,bK,bP));
 
+  // The permutation shape of mma.
+  auto pM = Int<16>{};
+  auto pN = Int<32>{};
+  auto pK = Int<16>{};
+
+  TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
+                                Layout<Shape<_1,_2,_1>>{},
+                                make_tile(pM,pN,pK));
+  auto kThreads = size(mma);
+
   // Define the C smem layouts (static).
   auto swizzle_c = composition(Swizzle<2,3,3>{},
-                               Layout<Shape <_16,_32>,
-                                      Stride<_32, _1>>{});
+                               make_layout(make_shape(pM,pN), LayoutRight{}));
   auto sC_layout = tile_to_shape(swizzle_c, make_shape(bM,bN));
 
+  // Atoms.
   TiledCopy copy_a = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{},
-                                     Layout<Shape<_8,_8>,Stride<_8,_1>>{},
-                                     Layout<Shape<_1,_8>>{});
+                                     Layout<Shape<Int<kThreads/8>,_8>,
+                                            Stride<_8,_1>>{},
+                                     Layout<Shape<_1,Int<128/sizeof_bits<TA>::value>>>{});
   TiledCopy copy_b = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TB>{},
-                                     Layout<Shape<_8,_8>,Stride<_8,_1>>{},
-                                     Layout<Shape<_1,_8>>{});
+                                     Layout<Shape<Int<kThreads/8>,_8>,
+                                            Stride<_8,_1>>{},
+                                     Layout<Shape<_1,Int<128/sizeof_bits<TB>::value>>>{});
   TiledCopy copy_c = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TC>{},
-                                     Layout<Shape<_4,_16>,Stride<_16,_1>>{},
-                                     Layout<Shape<_1,_8>>{});
+                                     Layout<Shape<Int<kThreads/16>,_16>,
+                                            Stride<_16,_1>>{},
+                                     Layout<Shape<_1,Int<128/sizeof_bits<TC>::value>>>{});
 
   Copy_Atom<SM75_U32x4_LDSM_N, TA> s2r_atom_a;
   Copy_Atom<SM75_U32x4_LDSM_N, TB> s2r_atom_b;
   Copy_Atom<UniversalCopy<uint32_t>, TC> r2s_atom_c;
-
-  TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
-                                Layout<Shape<_1,_2,_1>>{},
-                                Tile<_16,_32,_16>{});
 
   auto* kernel = &gemm_impl<
       decltype(prob_shape), decltype(cta_tiler),
@@ -303,7 +312,7 @@ gemm_tn(int m, int n, int k, int l,
                        cudaFuncAttributePreferredSharedMemoryCarveout, 100);
 
   dim3 num_blocks(size(ceil_div(m, bM)), size(ceil_div(n, bN)), l);
-  dim3 block_dims(size(mma));
+  dim3 block_dims(kThreads);
   kernel<<<num_blocks, block_dims, smem_size, stream>>>(
       prob_shape, cta_tiler,
       A, dA, sA_layout, copy_a, s2r_atom_a,
