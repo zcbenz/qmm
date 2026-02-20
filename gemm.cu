@@ -92,8 +92,8 @@ __global__ void gemm_impl(
   ThrMMA thr_mma = mma.get_slice(thread_idx);
   Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0)); // (MMA,MMA_M,MMA_K)
   Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0)); // (MMA,MMA_N,MMA_K)
-  Tensor tCrC = thr_mma.partition_fragment_C(gC);        // (MMA,MMA_M,MMA_N)
-  Tensor tCrC_half = make_tensor_like<TC>(tCrC);           // (MMA,MMA_M,MMA_N)
+  Tensor tCrC_accu = thr_mma.partition_fragment_C(gC);   // (MMA,MMA_M,MMA_N)
+  Tensor tCrC = make_tensor_like<TC>(tCrC_accu);         // (MMA,MMA_M,MMA_N)
 
   // Copy Atom retiling.
   TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma);
@@ -108,19 +108,19 @@ __global__ void gemm_impl(
 
   TiledCopy r2s_copy_c = make_tiled_copy_C(r2s_atom_c, mma);
   ThrCopy r2s_thr_copy_c = r2s_copy_c.get_slice(thread_idx);
-  Tensor r2s_tCrC = r2s_thr_copy_c.retile_S(tCrC_half);  // (CCPY,MMA_M,MMA_N)
+  Tensor r2s_tCrC = r2s_thr_copy_c.retile_S(tCrC);  // (CCPY,MMA_M,MMA_N)
   Tensor r2s_tCsC = r2s_thr_copy_c.partition_D(sC); // (CCPY,MMA_M,MMA_N)
 
   // Predicates for m/n bounds.
   Tensor tApA = make_tensor<bool>(make_shape(size<1>(tAsA), size<2>(tAsA)), Stride<_1,_0>{}); // (CPY_M,CPY_K)
   Tensor tBpB = make_tensor<bool>(make_shape(size<1>(tBsB), size<2>(tBsB)), Stride<_1,_0>{}); // (CPY_N,CPY_K)
+  Tensor tCpC = make_tensor<bool>(make_shape(size<1>(s2g_tCsC), size<2>(s2g_tCsC)));          // (CPY_M,CPY_N)
   Tensor cA = make_identity_tensor(make_shape(size<0>(sA), size<1>(sA))); // (BLK_M,BLK_K)
   Tensor cB = make_identity_tensor(make_shape(size<0>(sB), size<1>(sB))); // (BLK_N,BLK_K)
-  Tensor cC = make_identity_tensor(make_shape(size<0>(gC), size<1>(gC))); // (BLK_M,BLK_N)
+  Tensor cC = make_identity_tensor(make_shape(size<0>(sC), size<1>(sC))); // (BLK_M,BLK_N)
   Tensor tAcA = thr_copy_a.partition_S(cA);     // (CPY,CPY_M,CPY_K)
   Tensor tBcB = thr_copy_b.partition_S(cB);     // (CPY,CPY_N,CPY_K)
-  Tensor tCcC = thr_mma.partition_C(cC);    // (MMA,MMA_M,MMA_N)
-  // Tensor tCcC = s2g_thr_copy_c.partition_D(cC); // (CPY,CPY_M,CPY_N)
+  Tensor tCcC = s2g_thr_copy_c.partition_D(cC); // (CPY,CPY_M,CPY_N)
   CUTE_UNROLL
   for (int m = 0; m < size<0>(tApA); ++m) {
     tApA(m,0) = get<0>(tAcA(0,m,0)) < m_max_coord;
@@ -128,6 +128,13 @@ __global__ void gemm_impl(
   CUTE_UNROLL
   for (int n = 0; n < size<0>(tBpB); ++n) {
     tBpB(n,0) = get<0>(tBcB(0,n,0)) < n_max_coord;
+  }
+  CUTE_UNROLL
+  for (int m = 0; m < size<0>(tCpC); ++m) {
+    CUTE_UNROLL
+    for (int n = 0; n < size<0>(tCpC); ++n) {
+      tCpC(m,n) = elem_less(tCcC(0,m,n), make_coord(m_max_coord, n_max_coord));
+    }
   }
 
   // SMEM pipeline size (static).
@@ -150,7 +157,7 @@ __global__ void gemm_impl(
   }
 
   // Clear accumulators.
-  clear(tCrC);
+  clear(tCrC_accu);
 
   // RMEM pipeline size (static).
   auto K_BLOCK_MAX = size<2>(tCrA);
@@ -202,18 +209,18 @@ __global__ void gemm_impl(
       }
 
       // GEMM for current block.
-      gemm(mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
+      gemm(mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC_accu);
     }
   }
 
   // Epilogue.
   CUTE_UNROLL
-  for (int i = 0; i < size(tCrC); i++) {
-    tCrC_half(i) = TC(tCrC(i));
+  for (int i = 0; i < size(tCrC_accu); i++) {
+    tCrC(i) = TC(tCrC_accu(i));
   }
   copy(r2s_copy_c, r2s_tCrC, r2s_tCsC);
   __syncthreads();
-  copy(copy_c, s2g_tCsC, s2g_tCgC);
+  copy_if(copy_c, tCpC, s2g_tCsC, s2g_tCgC);
 }
 
 // Setup params for a NT GEMM

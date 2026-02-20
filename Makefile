@@ -1,4 +1,4 @@
-ARCH_FLAGS = -gencode arch=compute_$(shell __nvcc_device_query)a,code=sm_$(shell __nvcc_device_query)a
+ARCH_FLAGS = -gencode arch=compute_$(shell __nvcc_device_query)$(shell [ $(shell __nvcc_device_query) -ge 90 ] && echo "a" || true),code=sm_$(shell __nvcc_device_query)$(shell [ $(shell __nvcc_device_query) -ge 90 ] && echo "a" || true)
 C_FLAGS = -w --expt-relaxed-constexpr -std=c++20 -lcublas
 INCLUDE_FLAGS = -I cutlass/include -I cutlass/tools/util/include
 FLAGS = $(INCLUDE_FLAGS) $(ARCH_FLAGS) $(CUDA_FLAGS) $(C_FLAGS)
