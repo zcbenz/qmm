@@ -29,15 +29,15 @@ union SharedStorage {
 };
 
 template <typename ProblemShape, typename CtaTiler,
-          typename TA, typename AStride, typename ASmemLayout, typename TiledCopyA, typename S2RAtomA,
-          typename TB, typename BStride, typename BSmemLayout, typename TiledCopyB, typename S2RAtomB,
-          typename TC, typename CStride, typename CSmemLayout, typename TiledCopyC, typename R2SAtomC,
+          typename TA, typename StrideA, typename SmemLayoutA, typename TiledCopyA, typename S2RAtomA,
+          typename TB, typename StrideB, typename SmemLayoutB, typename TiledCopyB, typename S2RAtomB,
+          typename TC, typename StrideC, typename SmemLayoutC, typename TiledCopyC, typename R2SAtomC,
           typename TiledMma>
 __global__ void gemm_impl(
     ProblemShape shape_MNKL, CtaTiler cta_tiler,
-    TA const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
-    TB const* B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b, S2RAtomB s2r_atom_b,
-    TC      * C, CStride dC, CSmemLayout sC_layout, TiledCopyC copy_c, R2SAtomC r2s_atom_c,
+    TA const* A, StrideA dA, SmemLayoutA sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
+    TB const* B, StrideB dB, SmemLayoutB sB_layout, TiledCopyB copy_b, S2RAtomB s2r_atom_b,
+    TC      * C, StrideC dC, SmemLayoutC sC_layout, TiledCopyC copy_c, R2SAtomC r2s_atom_c,
     TiledMma mma) {
   CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));
   CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));
@@ -69,7 +69,7 @@ __global__ void gemm_impl(
 
   // Shared memory buffers.
   extern __shared__ char shared_memory[];
-  using SharedStorage = SharedStorage<TA, TB, TC, ASmemLayout, BSmemLayout, CSmemLayout>;
+  using SharedStorage = SharedStorage<TA, TB, TC, SmemLayoutA, SmemLayoutB, SmemLayoutC>;
   SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
   Tensor sA = make_tensor(make_smem_ptr(smem.mainloop.A.begin()), sA_layout); // (BLK_M,BLK_K,PIPE)
   Tensor sB = make_tensor(make_smem_ptr(smem.mainloop.B.begin()), sB_layout); // (BLK_N,BLK_K,PIPE)
