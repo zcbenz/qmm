@@ -12,10 +12,10 @@ namespace cute_gemm {
 
 using namespace cute;
 
-template <class Element,
-          class SmemLayoutA,
-          class SmemLayoutB,
-          class SmemLayoutC>
+template <typename Element,
+          typename SmemLayoutA,
+          typename SmemLayoutB,
+          typename SmemLayoutC>
 union SharedStorage {
   struct {
     ArrayEngine<Element, cosize_v<SmemLayoutA>> A;
@@ -40,6 +40,7 @@ __global__ void gemm_impl(
     TiledMma mma) {
   CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));
   CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));
+  CUTE_STATIC_ASSERT_V(size(copy_c) == size(mma));
   CUTE_STATIC_ASSERT_V(congruent(select<0,2,3>(shape_MNKL), dA));
   CUTE_STATIC_ASSERT_V(congruent(select<1,2,3>(shape_MNKL), dB));
   CUTE_STATIC_ASSERT_V(congruent(select<0,1,3>(shape_MNKL), dC));
@@ -48,14 +49,14 @@ __global__ void gemm_impl(
   auto [m_coord, n_coord, l_coord] = static_cast<uint3>(blockIdx);
 
   // Represent the full tensors.
-  Tensor mA_mkl = make_tensor(make_gmem_ptr(A), select<0, 2, 3>(shape_MNKL), dA); // (M,K,L)
-  Tensor mB_nkl = make_tensor(make_gmem_ptr(B), select<1, 2, 3>(shape_MNKL), dB); // (N,K,L)
-  Tensor mC_mnl = make_tensor(make_gmem_ptr(C), select<0, 1, 3>(shape_MNKL), dC); // (M,N,L)
+  Tensor mA_mkl = make_tensor(make_gmem_ptr(A), select<0,2,3>(shape_MNKL), dA); // (M,K,L)
+  Tensor mB_nkl = make_tensor(make_gmem_ptr(B), select<1,2,3>(shape_MNKL), dB); // (N,K,L)
+  Tensor mC_mnl = make_tensor(make_gmem_ptr(C), select<0,1,3>(shape_MNKL), dC); // (M,N,L)
 
   // Get batch slice.
-  Tensor mA = mA_mkl(_, _, l_coord); // (M,K)
-  Tensor mB = mB_nkl(_, _, l_coord); // (N,K)
-  Tensor mC = mC_mnl(_, _, l_coord); // (M,N)
+  Tensor mA = mA_mkl(_,_,l_coord); // (M,K)
+  Tensor mB = mB_nkl(_,_,l_coord); // (N,K)
+  Tensor mC = mC_mnl(_,_,l_coord); // (M,N)
 
   // Get the appropriate blocks for this thread block.
   auto cta_coord = make_coord(m_coord, n_coord, _); // (m,n,k)
@@ -165,8 +166,8 @@ __global__ void gemm_impl(
   int smem_pipe_write = K_PIPE_MAX - 1;
 
   // Prefetch SMEM => RMEM for first block in RMEM pipeline.
-  Tensor s2r_tCsA_p = s2r_tCsA(_,_,_,smem_pipe_read);
-  Tensor s2r_tCsB_p = s2r_tCsB(_,_,_,smem_pipe_read);
+  Tensor s2r_tCsA_p = s2r_tCsA(_,_,_,smem_pipe_read); // (ACPY,MMA_M,MMA_K)
+  Tensor s2r_tCsB_p = s2r_tCsB(_,_,_,smem_pipe_read); // (BCPY,MMA_N,MMA_K)
   if (K_BLOCK_MAX > 1) {
     cp_async_wait<K_PIPE_MAX - 2>(); // wait first tile
     __syncthreads();
@@ -213,16 +214,6 @@ __global__ void gemm_impl(
   }
 
   // Epilogue.
-#if 0
-  if (thread0()) {
-    print("r2s_copy_c: "); print(r2s_copy_c); print("\n");
-    print("r2s_tCrC: "); print(r2s_tCrC); print("\n");
-    print("r2s_tCsC: "); print(r2s_tCsC); print("\n");
-    print("copy_c: "); print(copy_c); print("\n");
-    print("s2g_tCsC: "); print(s2g_tCsC); print("\n");
-    print("s2g_tCgC: "); print(s2g_tCgC); print("\n");
-  }
-#else
   CUTE_UNROLL
   for (int i = 0; i < size(tCrC_accu); i++) {
     tCrC(i) = Element(tCrC_accu(i));
@@ -230,7 +221,6 @@ __global__ void gemm_impl(
   copy(r2s_copy_c, r2s_tCrC, r2s_tCsC);
   __syncthreads();
   copy_if(copy_c, tCpC, s2g_tCsC, s2g_tCgC);
-#endif
 }
 
 // Setup params for a NT GEMM
@@ -302,8 +292,11 @@ void gemm_nt(int m, int n, int k, int l,
       decltype(dC), decltype(sC_layout), decltype(copy_c), decltype(r2s_atom_c),
       decltype(mma)>;
 
-  // Set L1 to be SMEM only
-  int smem_size = int(sizeof(SharedStorage<Element, decltype(sA_layout), decltype(sB_layout), decltype(sC_layout)>));
+  // Set L1 to be SMEM only.
+  int smem_size = int(sizeof(SharedStorage<Element,
+                                           decltype(sA_layout),
+                                           decltype(sB_layout),
+                                           decltype(sC_layout)>));
   cudaFuncSetAttribute(kernel,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
   cudaFuncSetAttribute(kernel,
@@ -325,18 +318,18 @@ template <typename Element>
 void gemm_tn(int m, int n, int k, int l,
              const Element* A, const Element* B, Element* C) {
   // Define shapes (dynamic).
-  auto prob_shape = make_shape(m, n, k, l); // (M, N, K, L)
+  auto prob_shape = make_shape(m, n, k, l); // (M,N,K,L)
 
   // Define TN strides (mixed).
-  auto dA = make_stride(k, Int<1>{}, m * k); // (dM, dK, dL)
-  auto dB = make_stride(k, Int<1>{}, n * k); // (dN, dK, dL)
-  auto dC = make_stride(n, Int<1>{}, m * n); // (dM, dN, dL)
+  auto dA = make_stride(k, Int<1>{}, m * k); // (dM,dK,dL)
+  auto dB = make_stride(k, Int<1>{}, n * k); // (dN,dK,dL)
+  auto dC = make_stride(n, Int<1>{}, m * n); // (dM,dN,dL)
 
   // Define CTA tile sizes (static).
   auto bM = Int<16>{};
   auto bN = Int<128>{};
   auto bK = Int<64>{};
-  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M, BLK_N, BLK_K)
+  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
 
   // The permutation shape of mma.
   auto pM = Int<16>{};
