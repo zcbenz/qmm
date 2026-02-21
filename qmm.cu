@@ -122,7 +122,6 @@ __global__ void qmm_impl(
   ThrCopy s2r_thr_copy_b = s2r_copy_b.get_slice(thread_idx);
   Tensor s2r_tCsB = s2r_thr_copy_b.partition_S(sB); // (BCPY,MMA_N,MMA_K,PIPE)
   Tensor s2r_tCrB = s2r_thr_copy_b.retile_D(tCrB);  // (BCPY,MMA_N,MMA_K)
-  Tensor s2r_tCgS = s2r_thr_copy_b.retile_D(tCrB);  // (BCPY,MMA_N,MMA_K)
 
   TiledCopy r2s_copy_c = make_tiled_copy_C(r2s_atom_c, mma);
   ThrCopy r2s_thr_copy_c = r2s_copy_c.get_slice(thread_idx);
@@ -176,8 +175,13 @@ __global__ void qmm_impl(
   int smem_pipe_write = K_PIPE_MAX - 1;
 
   // Prefetch SMEM => RMEM for first block in RMEM pipeline.
-  Tensor s2r_tCsA_p = s2r_tCsA(_,_,_,smem_pipe_read);
-  Tensor s2r_tCsB_p = s2r_tCsB(_,_,_,smem_pipe_read);
+  Tensor s2r_tCsA_p = s2r_tCsA(_,_,_,smem_pipe_read); // (ACPY,MMA_M,MMA_K)
+  Tensor s2r_tCsB_p = s2r_tCsB(_,_,_,smem_pipe_read); // (BCPY,MMA_N,MMA_K)
+  if (false) {
+    print("s2r_thr_copy_b: "); print(s2r_thr_copy_b); print("\n");
+    print("s2r_tCsB_p: "); print(s2r_tCsB_p); print("\n");
+    print("s2r_tCrB: "); print(s2r_tCrB); print("\n");
+  }
   if (K_BLOCK_MAX > 1) {
     cp_async_wait<K_PIPE_MAX - 2>(); // wait first tile
     __syncthreads();
@@ -268,6 +272,16 @@ void qmm(
   auto bK = Int<64>{};
   auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
 
+  // The permutation shape of mma.
+  auto pM = Int<16>{};
+  auto pN = Int<32>{};
+  auto pK = Int<16>{};
+
+  TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
+                                Layout<Shape<_1,_2,_1>>{},
+                                make_tile(pM,pN,pK));
+  auto kThreads = size(mma);
+
   // Define the A/B smem layouts (static).
   auto swizzle_ab = composition(Swizzle<3,3,3>{},
                                 Layout<Shape <_8,Shape <_8, _8>>,
@@ -275,17 +289,6 @@ void qmm(
   auto bP = Int<5>{}; // pipeline
   auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM,bK,bP));
   auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN,bK,bP));
-
-  // The permutation shape of mma.
-  auto pM = Int<16>{};
-  auto pN = Int<32>{};
-  auto pK = Int<16>{};
-
-  // Create tiled MMA.
-  TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
-                                Layout<Shape<_1,_2,_1>>{},
-                                make_tile(pM,pN,pK));
-  auto kThreads = size(mma);
 
   // Define the C smem layouts (static).
   auto swizzle_c = composition(Swizzle<2,3,3>{},
@@ -297,21 +300,22 @@ void qmm(
       make_shape(n, make_shape(group_size, k / group_size), l),
       make_stride(k / group_size, Stride<_0, _1>{}, n * k / group_size));
 
+  // Atoms.
   TiledCopy copy_a = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Element>{},
                                      Layout<Shape<Int<kThreads/8>,_8>,
                                             Stride<_8,_1>>{},
                                      Layout<Shape<_1,Int<128/sizeof_bits<Element>::value>>>{});
-  TiledCopy copy_b = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint32_t>, Quant>{},
+  TiledCopy copy_b = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint32_t>, Element>{},
                                      Layout<Shape<Int<kThreads/8>,_8>,
                                             Stride<_8,_1>>{},
-                                     Layout<Shape<_1,Int<32/sizeof_bits<Quant>::value>>>{});
+                                     Layout<Shape<_1,Int<128/sizeof_bits<Element>::value>>>{});
   TiledCopy copy_c = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, Element>{},
                                      Layout<Shape<Int<kThreads/16>,_16>,
                                             Stride<_16,_1>>{},
                                      Layout<Shape<_1,Int<128/sizeof_bits<Element>::value>>>{});
 
   Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
-  Copy_Atom<UniversalCopy<uint32_t>, Quant> s2r_atom_b;
+  Copy_Atom<DefaultCopy, Quant> s2r_atom_b;
   Copy_Atom<UniversalCopy<uint32_t>, Element> r2s_atom_c;
 
   auto* kernel = &qmm_impl<
