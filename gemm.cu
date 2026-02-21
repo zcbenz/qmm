@@ -229,18 +229,18 @@ void gemm_nt(int m, int n, int k, int l,
              const Element* A, const Element* B, Element* C) {
 #if 0
   // Define shapes (dynamic).
-  auto prob_shape = make_shape(m, n, k, l); // (M, N, K, L)
+  auto prob_shape = make_shape(m, n, k, l); // (M,N,K,L)
 
   // Define TN strides (mixed).
-  auto dA = make_stride(Int<1>{}, m, m * k); // (dM, dK, dL)
-  auto dB = make_stride(Int<1>{}, n, n * k); // (dN, dK, dL)
-  auto dC = make_stride(Int<1>{}, m, m * n); // (dM, dN, dL)
+  auto dA = make_stride(Int<1>{}, m, m * k); // (dM,dK,dL)
+  auto dB = make_stride(Int<1>{}, n, n * k); // (dN,dK,dL)
+  auto dC = make_stride(Int<1>{}, m, m * n); // (dM,dN,dL)
 
   // Define CTA tile sizes (static).
   auto bM = Int<128>{};
   auto bN = Int<128>{};
   auto bK = Int<32>{};
-  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M, BLK_N, BLK_K)
+  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
 
   // The permutation shape of mma.
   auto pM = Int<32>{};
@@ -249,7 +249,7 @@ void gemm_nt(int m, int n, int k, int l,
 
   TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
                                 Layout<Shape<_2,_2,_1>>{},
-                                make_tile(pM,pN,pK));
+                                make_tile(pM, pN, pK));
   auto kThreads = size(mma);
 
   // Define the A/B smem layouts (static).
@@ -257,28 +257,28 @@ void gemm_nt(int m, int n, int k, int l,
                                 Layout<Shape<_64,_8>,
                                        Stride<_1,_64>>{});
   auto bP = Int<5>{}; // pipeline
-  auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM,bK,bP));
-  auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN,bK,bP));
+  auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM, bK, bP));
+  auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN, bK, bP));
 
   // Define the C smem layouts (static).
   auto swizzle_c = composition(Swizzle<3,3,3>{},
                                Layout<Shape<_128,_128>,
                                       Stride<_1,_128>>{});
-  auto sC_layout = tile_to_shape(swizzle_c, make_shape(bM,bN));
+  auto sC_layout = tile_to_shape(swizzle_c, make_shape(bM, bN));
 
   // Atoms.
   TiledCopy copy_a = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Element>{},
                                      Layout<Shape<_16,Int<kThreads/16>>,
                                             Stride<_1,_16>>{},
-                                     Layout<Shape<Int<128/sizeof_bits<Element>::value>>,_1>{});
+                                     Layout<Shape<Int<128/sizeof_bits_v<Element>>>,_1>{});
   TiledCopy copy_b = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Element>{},
                                      Layout<Shape<_16,Int<kThreads/16>>,
                                             Stride<_1,_16>>{},
-                                     Layout<Shape<Int<128/sizeof_bits<Element>::value>>,_1>{});
+                                     Layout<Shape<Int<128/sizeof_bits_v<Element>>>,_1>{});
   TiledCopy copy_c = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, Element>{},
                                      Layout<Shape<_16,Int<kThreads/16>>,
                                             Stride<_1,_16>>{},
-                                     Layout<Shape<Int<128/sizeof_bits<Element>::value>>,_1>{});
+                                     Layout<Shape<Int<128/sizeof_bits_v<Element>>>,_1>{});
 
   Copy_Atom<SM75_U16x8_LDSM_T, Element> s2r_atom_a;
   Copy_Atom<SM75_U16x8_LDSM_T, Element> s2r_atom_b;
@@ -346,13 +346,13 @@ void gemm_tn(int m, int n, int k, int l,
                                 Layout<Shape <_8,Shape <_8, _8>>,
                                        Stride<_8,Stride<_1,_64>>>{});
   auto bP = Int<5>{}; // pipeline
-  auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM,bK,bP));
-  auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN,bK,bP));
+  auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM, bK, bP));
+  auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN, bK, bP));
 
   // Define the C smem layouts (static).
   auto swizzle_c = composition(Swizzle<2,3,3>{},
-                               make_layout(make_shape(pM,pN), LayoutRight{}));
-  auto sC_layout = tile_to_shape(swizzle_c, make_shape(bM,bN));
+                               make_layout(make_shape(pM, pN), LayoutRight{}));
+  auto sC_layout = tile_to_shape(swizzle_c, make_shape(bM, bN));
 
   // Atoms.
   TiledCopy copy_a = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Element>{},
