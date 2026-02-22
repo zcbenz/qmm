@@ -48,6 +48,7 @@ __global__ void qmm_impl(
   CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));
   CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));
   CUTE_STATIC_ASSERT_V(size(copy_c) == size(mma));
+  CUTE_STATIC_ASSERT_V(size(copy_s) == size(mma));
   CUTE_STATIC_ASSERT_V(congruent(select<0,2,3>(shape_MNKL), dA));
   CUTE_STATIC_ASSERT_V(congruent(select<1,2,3>(shape_MNKL), dB));
   CUTE_STATIC_ASSERT_V(congruent(select<0,1,3>(shape_MNKL), dC));
@@ -104,8 +105,6 @@ __global__ void qmm_impl(
   ThrCopy thr_copy_b = copy_b.get_slice(thread_idx);
   Tensor tBgB = thr_copy_b.partition_S(gB); // (BCPY,BCPY_N,BCPY_K,k)
   Tensor tBsB = thr_copy_b.partition_D(sB); // (BCPY,BCPY_N,BCPY_K,PIPE)
-  Tensor tBgS = thr_copy_b.partition_S(gS); // (BCPY,BCPY_N,BCPY_K,k)
-  Tensor tBgZ = thr_copy_b.partition_S(gZ); // (BCPY,BCPY_N,BCPY_K,k)
 
   ThrCopy s2g_thr_copy_c = copy_c.get_slice(thread_idx);
   Tensor s2g_tCsC = s2g_thr_copy_c.partition_S(sC); // (CCPY,CCPY_M,CCPY_N)
@@ -126,8 +125,8 @@ __global__ void qmm_impl(
   Tensor tCrC_accu = thr_mma.partition_fragment_C(gC);     // (MMA,MMA_M,MMA_N)
   Tensor tCrC = make_tensor_like<Element>(tCrC_accu);      // (MMA,MMA_M,MMA_N)
 
-  Tensor tCgS = thr_mma.partition_B(gS); // (MMA,MMA_N,MMA_K,k)
-  Tensor tCgZ = thr_mma.partition_B(gZ); // (MMA,MMA_N,MMA_K,k)
+  Tensor tCrS = thr_mma.partition_fragment_B(sS(_,_,0)); // (MMA,MMA_N,MMA_K)
+  Tensor tCrZ = thr_mma.partition_fragment_B(sZ(_,_,0)); // (MMA,MMA_N,MMA_K)
 
   // Copy Atom retiling.
   TiledCopy s2r_copy_a = make_tiled_copy_A(s2r_atom_a, mma);
@@ -144,6 +143,13 @@ __global__ void qmm_impl(
   ThrCopy r2s_thr_copy_c = r2s_copy_c.get_slice(thread_idx);
   Tensor r2s_tCrC = r2s_thr_copy_c.retile_S(tCrC);  // (CCPY,MMA_M,MMA_N)
   Tensor r2s_tCsC = r2s_thr_copy_c.partition_D(sC); // (CCPY,MMA_M,MMA_N)
+
+  TiledCopy s2r_copy_s = make_tiled_copy_B(s2r_atom_s, mma);
+  ThrCopy s2r_thr_copy_s = s2r_copy_s.get_slice(thread_idx);
+  Tensor s2r_tCsS = s2r_thr_copy_s.partition_S(sS); // (SCPY,MMA_N,MMA_K,PIPE)
+  Tensor s2r_tCrS = s2r_thr_copy_s.retile_D(tCrS);  // (SCPY,MMA_N,MMA_K)
+  Tensor s2r_tCsZ = s2r_thr_copy_s.partition_S(sZ); // (SCPY,MMA_N,MMA_K,PIPE)
+  Tensor s2r_tCrZ = s2r_thr_copy_s.retile_D(tCrZ);  // (SCPY,MMA_N,MMA_K)
 
   // Predicates for m/n bounds.
   Tensor tApA = make_tensor<bool>(make_shape(size<1>(tAsA),     size<2>(tAsA)    ), Stride<_1,_0>{}); // (CPY_M,CPY_K)
@@ -172,6 +178,8 @@ __global__ void qmm_impl(
   for (int k_pipe = 0; k_pipe < K_PIPE_MAX - 1; ++k_pipe) {
     copy_if(copy_a, tApA, tAgA(_,_,_,k_tile_next), tAsA(_,_,_,k_pipe));
     copy(copy_b, tBgB(_,_,_,k_tile_next), tBsB(_,_,_,k_pipe));
+    copy(copy_s, tSgS(_,_,_,k_tile_next), tSsS(_,_,_,k_pipe));
+    copy(copy_s, tSgZ(_,_,_,k_tile_next), tSsZ(_,_,_,k_pipe));
     cp_async_fence();
 
     --k_tile_count;
@@ -192,11 +200,15 @@ __global__ void qmm_impl(
   // Prefetch SMEM => RMEM for first block in RMEM pipeline.
   Tensor s2r_tCsA_p = s2r_tCsA(_,_,_,smem_pipe_read); // (ACPY,MMA_M,MMA_K)
   Tensor s2r_tCsB_p = s2r_tCsB(_,_,_,smem_pipe_read); // (BCPY,MMA_N,MMA_K)
+  Tensor s2r_tCsS_p = s2r_tCsS(_,_,_,smem_pipe_read); // (SCPY,MMA_N,MMA_K)
+  Tensor s2r_tCsZ_p = s2r_tCsZ(_,_,_,smem_pipe_read); // (SCPY,MMA_N,MMA_K)
   if (K_BLOCK_MAX > 1) {
     cp_async_wait<K_PIPE_MAX - 2>(); // wait first tile
     __syncthreads();
     copy(s2r_atom_a, s2r_tCsA_p(_,_,0), s2r_tCrA(_,_,0));
     copy(s2r_atom_b, s2r_tCsB_p(_,_,0), s2r_tCrB(_,_,0));
+    copy(s2r_atom_s, s2r_tCsS_p(_,_,0), s2r_tCrS(_,_,0));
+    copy(s2r_atom_s, s2r_tCsZ_p(_,_,0), s2r_tCrZ(_,_,0));
   }
 
   // Loop over k-tiles in SMEM pipeline.
@@ -216,11 +228,15 @@ __global__ void qmm_impl(
       int k_block_next = (k_block + 1) % K_BLOCK_MAX;
       copy(s2r_atom_a, s2r_tCsA_p(_,_,k_block_next), s2r_tCrA(_,_,k_block_next));
       copy(s2r_atom_b, s2r_tCsB_p(_,_,k_block_next), s2r_tCrB(_,_,k_block_next));
+      copy(s2r_atom_s, s2r_tCsS_p(_,_,k_block_next), s2r_tCrS(_,_,k_block_next));
+      copy(s2r_atom_s, s2r_tCsZ_p(_,_,k_block_next), s2r_tCrZ(_,_,k_block_next));
 
       // Async load GMEM => SMEM for next tile.
       if (k_block == 0) {
         copy_if(copy_a, tApA, tAgA(_,_,_,k_tile_next), tAsA(_,_,_,smem_pipe_write));
         copy(copy_b, tBgB(_,_,_,k_tile_next), tBsB(_,_,_,smem_pipe_write));
+        copy(copy_s, tSgS(_,_,_,k_tile_next), tSsS(_,_,_,smem_pipe_write));
+        copy(copy_s, tSgZ(_,_,_,k_tile_next), tSsZ(_,_,_,smem_pipe_write));
         cp_async_fence();
 
         --k_tile_count;
@@ -235,8 +251,8 @@ __global__ void qmm_impl(
       // Dequantize B.
       Tensor quant = tCrB(_,_,k_block);
       Tensor weight = tCrB_dequant(_,_,k_block);
-      Tensor scale = tCgS(_,_,k_block,k_tile_next);
-      Tensor zero_point = tCgZ(_,_,k_block,k_tile_next);
+      Tensor scale = tCrS(_,_,k_block);
+      Tensor zero_point = tCrZ(_,_,k_block);
       for (int i = 0; i < size(weight); i++) {
         weight(i) = quant(i) * scale(i) + zero_point(i);
       }
@@ -300,15 +316,11 @@ void qmm(
                                make_layout(make_shape(pM, pN), LayoutRight{}));
   auto sC_layout = tile_to_shape(swizzle_c, make_shape(bM, bN));
 
-  // Define the S/Z smem layouts (static).
-  // TODO: Do we need swizzle?
-  auto bZ = Int<ceil_div(bK, group_size)>{};
-#if 0
-  auto sS_layout = make_layout(make_shape(bN, bZ, bP),
-                               make_stride(bZ, Int<1>{}, bN * bZ));
-#else
-  auto sS_layout = sA_layout;
-#endif
+  // Define the scales smem layouts (static).
+  auto bZ = ceil_div(bK, group_size);
+  auto sS_layout = make_layout(
+      make_shape(bN, make_shape(group_size, bZ), bP),
+      make_stride(bZ, Stride<_0, _1>{}, bN * bZ));
 
   // Define layout of scales (mixed).
   auto S_layout = make_layout(
@@ -317,25 +329,17 @@ void qmm(
 
   // Atoms.
   TiledCopy copy_a = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Element>{},
-                                     Layout<Shape<Int<kThreads/8>,_8>,
-                                            Stride<_8,_1>>{},
+                                     make_layout(Shape<Int<kThreads/8>,_8>{}, LayoutRight{}),
                                      Layout<Shape<_1,Int<128/sizeof_bits_v<Element>>>>{});
   TiledCopy copy_b = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint32_t>, Quant>{},
-                                     Layout<Shape<Int<kThreads/8>,_8>,
-                                            Stride<_8,_1>>{},
+                                     make_layout(Shape<Int<kThreads/8>,_8>{}, LayoutRight{}),
                                      Layout<Shape<_1,Int<32/sizeof_bits_v<Quant>>>>{});
   TiledCopy copy_c = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, Element>{},
-                                     Layout<Shape<Int<kThreads/16>,_16>,
-                                            Stride<_16,_1>>{},
+                                     make_layout(Shape<Int<kThreads/16>,_16>{}, LayoutRight{}),
                                      Layout<Shape<_1,Int<128/sizeof_bits_v<Element>>>>{});
-#if 0
-  TiledCopy copy_s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint32_t>, Element>{},
-                                     Layout<Shape<Int<kThreads/2>,_2>,
-                                            Stride<_1,_1>>{},
-                                     Layout<Shape<_1,Int<32/sizeof_bits_v<Element>>>>{});
-#else
-  TiledCopy copy_s = copy_a;
-#endif
+  TiledCopy copy_s = make_tiled_copy(Copy_Atom<UniversalCopy<Element>, Element>{},
+                                     make_layout(make_shape(Int<kThreads/bZ>{}, bZ), LayoutRight{}),
+                                     Layout<Shape<_1,_1>>{});
 
   Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
   Copy_Atom<UniversalCopy<Quant>, Quant> s2r_atom_b;
@@ -526,7 +530,7 @@ int main(int argc, char** argv) {
 #if 1
   // Timing iterations
   const int timing_iterations = 100;
-  double gflops = (2.0*m*n*k) * 1e-9;
+  const double tflops = (2.0 * m * n * k) * 1e-12;
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
@@ -542,7 +546,7 @@ int main(int argc, char** argv) {
   }
   double cute_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
-  printf("QMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
+  printf("CUTE:    [%5.1f]TFlop/s  (%6.4f)ms\n", tflops / cute_time, cute_time*1000);
 
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
@@ -555,9 +559,9 @@ int main(int argc, char** argv) {
   }
   double cublas_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
-  printf("CUBLAS:  [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cublas_time, cublas_time*1000);
+  printf("CUBLAS:  [%5.1f]TFlop/s  (%6.4f)ms\n", tflops / cublas_time, cublas_time*1000);
 
-  printf("Speedup: %.2fx\n", cublas_time / cute_time);
+  printf("Speedup: [%5.2f]x\n", cublas_time / cute_time);
 #endif
 
   return 0;
