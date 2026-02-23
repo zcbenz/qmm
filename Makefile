@@ -1,6 +1,6 @@
 CUDA_COMPUTE_CAPABILITY = $(shell __nvcc_device_query)$(shell [ $(shell __nvcc_device_query) -ge 90 ] && echo "a" || true)
 CUDA_FLAGS = -w --expt-relaxed-constexpr -std=c++20 -lcublas -gencode arch=compute_$(CUDA_COMPUTE_CAPABILITY),code=sm_$(CUDA_COMPUTE_CAPABILITY)
-CUTLASS_FLAGS = -DNDEBUG -Xcompiler=-Wconversion -Xcompiler=-fno-strict-aliasing
+CUTLASS_FLAGS = -DNDEBUG -Xcompiler=-fno-strict-aliasing
 INCLUDE_FLAGS = -I cutlass/include -I cutlass/tools/util/include -I cutlass/tools/profiler/include
 FLAGS = $(CUDA_FLAGS) $(CUTLASS_FLAGS) $(INCLUDE_FLAGS)
 

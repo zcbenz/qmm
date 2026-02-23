@@ -28,10 +28,16 @@ namespace cutlass_gemm {
 
 template <typename GroupSize, typename Element, typename Quant, typename F>
 void qmm_sm90(
-    int64_t m, int64_t n, int64_t k, int64_t l,
+    const Element* A,
+    const Quant* B,
+    const Element* S,
+    const Element* Z,
+    Element* D,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    int64_t l,
     GroupSize group_size,
-    const Element* A, const Quant* B, Element* D,
-    const Element* S, const Element* Z,
     F&& launch_kernel) {
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
   using namespace cute;
@@ -43,10 +49,10 @@ void qmm_sm90(
 
   using Arch = cutlass::arch::Sm90;
   using Accumulator = float;
-  using TileShape = Shape<_128,_16,Int<kTileShapeK>>;
-  using ClusterShape = Shape<_1,_1,_1>;
+  using TileShape = Shape<_128, _16, Int<kTileShapeK>>;
+  using ClusterShape = Shape<_1, _1, _1>;
 
-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+  using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       Arch,
       cutlass::arch::OpClassTensorOp,
       TileShape,
@@ -55,29 +61,35 @@ void qmm_sm90(
       Accumulator,
       Accumulator,
       // ElementC:
-      void, cutlass::layout::ColumnMajor, kAlignmentA,
+      void,
+      cutlass::layout::ColumnMajor,
+      kAlignmentA,
       // ElementD:
-      Element, cutlass::layout::ColumnMajor, kAlignmentA,
+      Element,
+      cutlass::layout::ColumnMajor,
+      kAlignmentA,
       cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
 
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+  using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       Arch,
       cutlass::arch::OpClassTensorOp,
       // ElementA:
-      cute::tuple<Quant, Element, Element>, cutlass::layout::RowMajor, kAlignmentB,
+      cute::tuple<Quant, Element, Element>,
+      cutlass::layout::RowMajor,
+      kAlignmentB,
       // ElementB:
-      Element, cutlass::layout::ColumnMajor, kAlignmentA,
+      Element,
+      cutlass::layout::ColumnMajor,
+      kAlignmentA,
       Accumulator,
-      TileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))
-      >,
+      TileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename Epilogue::SharedStorage))>,
       cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int,int,int,int>,
-      CollectiveMainloop,
-      CollectiveEpilogue>;
+  using GemmKernel = cutlass::gemm::kernel::
+      GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   auto dA = make_stride(k, Int<1>{}, m * k);
@@ -87,10 +99,10 @@ void qmm_sm90(
 
   Gemm gemm;
   typename Gemm::Arguments args{
-    cutlass::gemm::GemmUniversalMode::kGemm,
-    {n, m, k, l},
-    {B, dB, A, dA, S, dS, group_size, Z},
-    {{1.f, 0.f}, D, dD, D, dD}};
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {int(n), int(m), int(k), int(l)},
+      {B, dB, A, dA, S, dS, group_size, Z},
+      {{1.f, 0.f}, D, dD, D, dD}};
 
   CHECK_CUTLASS_ERROR(gemm.can_implement(args));
   CHECK_CUTLASS_ERROR(gemm.initialize(args, nullptr));
@@ -103,7 +115,6 @@ void qmm_sm90(
       GemmKernel::get_block_shape(),
       GemmKernel::SharedStorageSize,
       kernel_params);
-
 #else
   throw std::runtime_error(
       "[quantized_matmul] Hopper-only kernel is not available.");
@@ -229,13 +240,13 @@ int main(int argc, char** argv) {
 
   // Run once
   cutlass_gemm::qmm_sm90(
-      m, n, k, l,
-      cute::Int<group_size>{},
       d_A.data().get(),
       d_B.data().get(),
-      d_D.data().get(),
       d_S.data().get(),
       d_Z.data().get(),
+      d_D.data().get(),
+      m, n, k, l,
+      cute::Int<group_size>{},
       launch_kernel);
   CUTE_CHECK_LAST();
 
@@ -269,13 +280,13 @@ int main(int argc, char** argv) {
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
     cutlass_gemm::qmm_sm90(
-        m, n, k, l,
-        cute::Int<group_size>{},
         d_A.data().get(),
         d_B.data().get(),
-        d_D.data().get(),
         d_S.data().get(),
         d_Z.data().get(),
+        d_D.data().get(),
+        m, n, k, l,
+        cute::Int<group_size>{},
         launch_kernel);
   }
   double cute_time = timer.seconds() / timing_iterations;
