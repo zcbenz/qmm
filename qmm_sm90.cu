@@ -26,7 +26,15 @@ inline void check_cutlass_error(const char* name, cutlass::Status status) {
 
 namespace cutlass_gemm {
 
-template <typename GroupSize, typename Element, typename Quant, typename F>
+using namespace cute;
+
+template <
+    typename TileShape_ = Shape<_128, _16>,
+    typename ClusterShape = Shape<_1, _1, _1>,
+    typename Element,
+    typename Quant,
+    typename GroupSize,
+    typename F>
 void qmm_sm90(
     const Element* A,
     const Quant* B,
@@ -40,8 +48,6 @@ void qmm_sm90(
     GroupSize group_size,
     F&& launch_kernel) {
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
-  using namespace cute;
-
   constexpr int kAlignmentA = 128 / sizeof_bits<Element>::value;
   constexpr int kAlignmentB = 128 / sizeof_bits<Quant>::value;
   constexpr int kTileShapeK =
@@ -50,8 +56,7 @@ void qmm_sm90(
 
   using Arch = cutlass::arch::Sm90;
   using Accumulator = float;
-  using TileShape = Shape<_128, _16, Int<kTileShapeK>>;
-  using ClusterShape = Shape<_1, _1, _1>;
+  using TileShape = decltype(append(TileShape_{}, Int<kTileShapeK>{}));
 
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       Arch,
@@ -115,10 +120,12 @@ void qmm_sm90(
 
   auto* kernel = &cutlass::device_kernel<GemmKernel>;
   void* kernel_params[] = {const_cast<Gemm::Params*>(&gemm.params())};
+  auto cluster = ClusterShape{};
   launch_kernel(
       reinterpret_cast<void*>(kernel),
       gemm.get_grid_shape(gemm.params()),
       GemmKernel::get_block_shape(),
+      {get<0>(cluster),get<1>(cluster),get<2>(cluster)},
       GemmKernel::SharedStorageSize,
       kernel_params);
 #else
@@ -179,8 +186,20 @@ void cublas_gemm(char transA, char transB,
   }
 }
 
-void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, size_t smem_bytes, void** args) {
-  cudaLaunchKernel(func, num_blocks, block_dims, args, smem_bytes, /* stream */ nullptr);
+void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, dim3 cluster, size_t smem_bytes, void** args) {
+  cudaLaunchConfig_t config = {};
+  config.gridDim = num_blocks;
+  config.blockDim = block_dims;
+  config.dynamicSmemBytes = smem_bytes;
+  config.stream = nullptr;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = cluster.x;
+  attrs[0].val.clusterDim.y = cluster.y;
+  attrs[0].val.clusterDim.z = cluster.z;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  cudaLaunchKernelExC(&config, func, args);
 }
 
 int main(int argc, char** argv) {
