@@ -16,7 +16,7 @@
 inline void check_cutlass_error(const char* name, cutlass::Status status) {
   if (status != cutlass::Status::kSuccess) {
     fprintf(stderr,
-            "{} failed with code: {}.",
+            "%s failed with code: %s.\n",
             name,
             cutlass::cutlassGetStatusString(status));
     exit(1);
@@ -44,7 +44,8 @@ void qmm_sm90(
 
   constexpr int kAlignmentA = 128 / sizeof_bits<Element>::value;
   constexpr int kAlignmentB = 128 / sizeof_bits<Quant>::value;
-  constexpr int kTileShapeK = 128 * 8 / sizeof_bits<Element>::value;
+  constexpr int kTileShapeK =
+      std::max(64, 128 * 8 / sizeof_bits<Element>::value);
   static_assert(group_size % kTileShapeK == 0);
 
   using Arch = cutlass::arch::Sm90;
@@ -70,11 +71,16 @@ void qmm_sm90(
       kAlignmentA,
       cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
 
+  // Note that A/B are swapped and transposed to use TMA epilogue.
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       Arch,
       cutlass::arch::OpClassTensorOp,
       // ElementA:
-      cute::tuple<Quant, Element, Element>,
+      std::conditional_t<
+          // Only int quants have zero points.
+          sizeof_bits_v<Quant> <= 8 && cutlass::has_negative_zero_v<Quant>,
+          tuple<Quant, Element>,
+          tuple<Quant, Element, Element>>,
       cutlass::layout::RowMajor,
       kAlignmentB,
       // ElementB:
@@ -178,15 +184,15 @@ void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, size_t smem_byt
 }
 
 int main(int argc, char** argv) {
-  int m = 5120;
+  int m = 16;
   if (argc >= 2)
     sscanf(argv[1], "%d", &m);
 
-  int n = 5120;
+  int n = 16384;
   if (argc >= 3)
     sscanf(argv[2], "%d", &n);
 
-  int k = 4096;
+  int k = 16384;
   if (argc >= 4)
     sscanf(argv[3], "%d", &k);
 
@@ -207,6 +213,7 @@ int main(int argc, char** argv) {
   using Quant = cute::uint4b_t;
 
   constexpr int group_size = 64;
+  constexpr bool fp_quant = cutlass::sizeof_bits_v<Quant> <= 8 && cutlass::has_negative_zero_v<Quant>;
 
   thrust::device_vector<Element> d_A(m*k*l);
   thrust::device_vector<Quant>   d_B(n*k*l);    // quantized B
@@ -220,11 +227,20 @@ int main(int argc, char** argv) {
   cutlass::reference::device::BlockFillRandomUniform(
       d_A.data().get(), d_A.size(), seed, Element(0.1f), Element(-0.1f));
   cutlass::reference::device::BlockFillRandomUniform(
-      d_B.data().get(), d_B.size(), seed, 0, 6);
+      d_B.data().get(), d_B.size(), seed, Quant(0), Quant(6));
   cutlass::reference::device::BlockFillRandomUniform(
       d_S.data().get(), d_S.size(), seed, Element(0.1f), Element(-0.1f));
+  if constexpr (fp_quant) {
+    cutlass::reference::device::BlockFillSequential(
+        d_Z.data().get(), d_Z.size(), Element(0.f), Element(0.f));
+  } else {
+    cutlass::reference::device::BlockFillRandomUniform(
+        d_Z.data().get(), d_Z.size(), seed, Element(0.1f), Element(-0.1f));
+  }
   cutlass::reference::device::BlockFillSequential(
-      d_Z.data().get(), d_Z.size(), Element(-1.f), Element(0.f));
+      d_D.data().get(), d_D.size(), Element(-1.f), Element(0.f));
+  cutlass::reference::device::BlockFillSequential(
+      d_D_ref.data().get(), d_D_ref.size(), Element(-1.f), Element(0.f));
 
   using namespace cute;
   cudaStream_t stream = nullptr;
@@ -232,7 +248,7 @@ int main(int argc, char** argv) {
       d_B_dq.data().get(),
       d_B.data().get(),
       make_layout(make_shape(n, k, l), make_stride(k, Int<1>{}, n * k)),
-      d_S.data().get(), 
+      d_S.data().get(),
       d_Z.data().get(),
       make_layout(make_shape(n, k / group_size, l), make_stride(Int<1>{}, n, n * k / group_size)),
       group_size,
@@ -243,7 +259,7 @@ int main(int argc, char** argv) {
       d_A.data().get(),
       d_B.data().get(),
       d_S.data().get(),
-      d_Z.data().get(),
+      fp_quant ? nullptr : d_Z.data().get(),
       d_D.data().get(),
       m, n, k, l,
       cute::Int<group_size>{},
@@ -283,7 +299,7 @@ int main(int argc, char** argv) {
         d_A.data().get(),
         d_B.data().get(),
         d_S.data().get(),
-        d_Z.data().get(),
+        fp_quant ? nullptr : d_Z.data().get(),
         d_D.data().get(),
         m, n, k, l,
         cute::Int<group_size>{},
