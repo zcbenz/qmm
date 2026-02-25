@@ -51,7 +51,7 @@ namespace cg = cooperative_groups;
 // Dequantizes 8 uint8_t values and accumulates the result with 8 half values
 // from A into float sums: sums_f += A_h * dequant(B_quant).
 __device__ __forceinline__ void accumulate_8_elements_8bit(
-    uint64_t values_quant, // 8 packed uint8_t values
+    uint64_t packed_quant, // 8 packed uint8_t values
     half scale,
     half bias,
     const half* a,
@@ -64,7 +64,7 @@ __device__ __forceinline__ void accumulate_8_elements_8bit(
   uint8_t q[8];
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    q[i] = (values_quant >> (i * 8)) & 0xFF;
+    q[i] = (packed_quant >> (i * 8)) & 0xFF;
   }
 
   // Dequantize 8 values into 4 half2 vectors.
@@ -114,12 +114,11 @@ __device__ __forceinline__ void accumulate_8_elements_8bit(
 
 // Accumulate 8 Elements (bfloat16 precision).
 __device__ __forceinline__ void accumulate_8_elements_8bit(
-    uint64_t values_quant, // 8 packed uint8_t values
+    uint64_t packed_quant, // 8 packed uint8_t values
     nv_bfloat16 scale,
     nv_bfloat16 bias,
     const nv_bfloat16* a,
     float* sums_f) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   float scale_f = __bfloat162float(scale);
   float bias_f = __bfloat162float(bias);
 
@@ -128,7 +127,7 @@ __device__ __forceinline__ void accumulate_8_elements_8bit(
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
     a_f[i] = __bfloat162float(a[i]);
-    uint8_t q_val = (values_quant >> (i * 8)) & 0xFF;
+    uint8_t q_val = (packed_quant >> (i * 8)) & 0xFF;
     b_dequant_f[i] = float(q_val) * scale_f + bias_f;
   }
 
@@ -136,12 +135,11 @@ __device__ __forceinline__ void accumulate_8_elements_8bit(
   for (int i = 0; i < 8; ++i) {
     sums_f[i] = fmaf(a_f[i], b_dequant_f[i], sums_f[i]);
   }
-#endif
 }
 
 // Accumulate 8 Elements (float precision).
 __device__ __forceinline__ void accumulate_8_elements_8bit(
-    uint64_t values_quant, // 8 packed uint8_t values
+    uint64_t packed_quant, // 8 packed uint8_t values
     float scale,
     float bias,
     const float* a,
@@ -154,7 +152,7 @@ __device__ __forceinline__ void accumulate_8_elements_8bit(
   float v[8];
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    uint8_t q_val = (values_quant >> (i * 8)) & 0xFF;
+    uint8_t q_val = (packed_quant >> (i * 8)) & 0xFF;
     v[i] = float(q_val) * scale + bias;
   }
 
@@ -171,9 +169,10 @@ __device__ __forceinline__ void accumulate_8_elements_8bit(
 
 template <
     int rows_per_block,
-    int n_per_thread,
+    int elems_per_thread,
     int group_size,
     bool has_bias,
+    bool has_residue_k,
     typename T,
     typename Q>
 __global__ void qmv_8bit_kernel(
@@ -188,8 +187,8 @@ __global__ void qmv_8bit_kernel(
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
   // How many groups (and scales/biases) in a row/block.
-  const int groups_per_row = cuda::ceil_div(k, group_size);
-  const int groups_per_block = rows_per_block * groups_per_row;
+  int groups_per_row = k / group_size;
+  int groups_per_block = rows_per_block * groups_per_row;
 
   // The start of row that this block handles.
   int row_head = block.group_index().x * rows_per_block;
@@ -200,6 +199,10 @@ __global__ void qmv_8bit_kernel(
     return;
   }
 
+  // Advance pointers of x/out.
+  x += block.group_index().y * k;
+  out += block.group_index().y * n;
+
   // Scales and biases are loaded in shared memory.
   extern __shared__ char shared_buffer[];
   T* scales_smem = reinterpret_cast<T*>(shared_buffer);
@@ -209,7 +212,6 @@ __global__ void qmv_8bit_kernel(
   }
 
   // Load scales/biases used by current block.
-  // TODO: Use vectorized read when groups_per_row % 2 == 0.
   constexpr int block_size = rows_per_block * WARP_SIZE;
   for (int i = block.thread_rank(); i < groups_per_block; i += block_size) {
     int t_row = i / groups_per_row;
@@ -227,65 +229,49 @@ __global__ void qmv_8bit_kernel(
 
   // Advance w/scales/biases to current row.
   w += static_cast<int64_t>(row) * k;
-  scales_smem += warp.meta_group_rank() * groups_per_row;
+  scales = scales_smem + warp.meta_group_rank() * groups_per_row;
   if constexpr (has_bias) {
-    biases_smem += warp.meta_group_rank() * groups_per_row;
+    biases = biases_smem + warp.meta_group_rank() * groups_per_row;
   }
-
-  // Advance x/out to current row of x.
-  int x_row = block.group_index().y; // [0, m)
-  x += x_row * k;
-  out += x_row * n;
 
   // Accumulations of current row.
-  float sums[n_per_thread] = {};
+  float sums[elems_per_thread] = {};
 
-  const int lane_offset = warp.thread_rank() * n_per_thread;
-
-  constexpr int k_per_iter = WARP_SIZE * n_per_thread;  // Elements processed per warp per iteration (e.g., 32*8 = 256)
-  int k_id = 0; // Current position along the K dimension
-
-  for (; k_id + k_per_iter <= k; k_id += k_per_iter) {
-    const Q* current_b_ptr = w + lane_offset + k_id;
-    uint64_t value = *reinterpret_cast<const uint64_t*>(current_b_ptr);
-
-    int current_meta_k = (lane_offset + k_id) / group_size;
-    T scale = scales_smem[current_meta_k];
+  // Loop over k dimension.
+  constexpr int elems_per_warp = WARP_SIZE * elems_per_thread;
+  for (int r = 0; r < k / elems_per_warp; ++r) {
+    int64_t idx = warp.thread_rank() * elems_per_thread + r * elems_per_warp;
+    // Read quantized weights.
+    uint64_t packed_quant = *reinterpret_cast<const uint64_t*>(w + idx);
+    // Read scales and biases.
+    T scale = scales[idx / group_size];
     T zp{0};
     if constexpr (has_bias) {
-      zp = biases_smem[current_meta_k];
+      zp = biases[idx / group_size];
     }
-
-    accumulate_8_elements_8bit(value, scale, zp, x + lane_offset + k_id, sums);
+    // Vectorized dequantized accumulation.
+    accumulate_8_elements_8bit(packed_quant, scale, zp, x + idx, sums);
   }
 
-#if 0
-  // Handle the tail elements along K dimension for this thread.
-  // This loop handles the final iteration if k is not a multiple of k_per_iter.
-  // Since K % n_per_thread == 0 is enforced, each thread
-  // processes a full set of n_per_thread if it has work left.
-  if (lane_offset + k_id < k) {  // Check if this thread has remaining elements
-    const uint8_t* current_b_ptr = w + lane_offset + k_id;
-    uint64_t value = *reinterpret_cast<const uint64_t*>(current_b_ptr);
-
-    // Calculate k_block index for the tail part
-    int current_meta_k = (lane_offset + k_id) / group_size;
-    T scale = b_scale_vec_thread[current_meta_k];
-    T zp = 0;
-    if constexpr (has_bias) {
-      zp = b_zp_vec_thread[current_meta_k];
+  if constexpr (has_residue_k) {
+    // Handle remaining elements in k dimension.
+    int rest = k % elems_per_warp;
+    int64_t idx = warp.thread_rank() * elems_per_thread + k - rest;
+    if (idx < k) {
+      uint64_t packed_quant = *reinterpret_cast<const uint64_t*>(w + idx);
+      T scale = scales[idx / group_size];
+      T zp{0};
+      if constexpr (has_bias) {
+        zp = biases[idx / group_size];
+      }
+      accumulate_8_elements_8bit(packed_quant, scale, zp, x + idx, sums);
     }
-    // Pointer to A data for the tail part
-    const T* current_a_ptr = x + lane_offset + k_id;
-    // Perform dequantization and accumulation
-    accumulate_8_elements_8bit(value, scale, zp, current_a_ptr, sums);
   }
-#endif
 
-  // Result for current warp.
+  // Result for current row.
   float sum = 0.0f;
 #pragma unroll
-  for (int i = 0; i < n_per_thread; ++i) {
+  for (int i = 0; i < elems_per_thread; ++i) {
     sum += sums[i];
   }
   sum = cg::reduce(warp, sum, cg::plus<float>{});
@@ -307,35 +293,37 @@ void qmv_8bit(
     int k,
     F&& launch_kernel) {
   constexpr int rows_per_block = 8;
-  constexpr int n_per_thread = 8;
-
-  const int groups_per_row = cuda::ceil_div(k, group_size);
+  constexpr int elems_per_thread = 8;
 
   dim3 num_blocks(cuda::ceil_div(n, rows_per_block), m);
   dim3 block_dims(WARP_SIZE, rows_per_block);
 
+  int groups_per_row = k / group_size;
   size_t smem_bytes = (biases ? 2 : 1) * sizeof(T) * groups_per_row * rows_per_block;
 
   void* args[] = { &x, &w, &scales, &biases, &out, &n, &k };
   dispatch_bool(biases, [&](auto has_bias) {
-    auto* kernel = &qmv_8bit_kernel<
-        rows_per_block,
-        n_per_thread, 
-        group_size,
-        has_bias.value,
-        cuda_type_t<T>,
-        cuda_type_t<Q>>;
-    launch_kernel(
-        reinterpret_cast<void*>(kernel),
-        num_blocks,
-        block_dims,
-        {},
-        smem_bytes,
-        args);
+    dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
+      auto* kernel = &qmv_8bit_kernel<
+          rows_per_block,
+          elems_per_thread,
+          group_size,
+          has_bias.value,
+          has_residue_k.value,
+          cuda_type_t<T>,
+          cuda_type_t<Q>>;
+      launch_kernel(
+          reinterpret_cast<void*>(kernel),
+          num_blocks,
+          block_dims,
+          {},
+          smem_bytes,
+          args);
+    });
   });
 }
 
-}
+} // namespace cu
 
 template <typename Element>
 void cublas_gemm(char transA, char transB,
@@ -401,11 +389,11 @@ int main(int argc, char** argv) {
   if (argc >= 2)
     sscanf(argv[1], "%d", &m);
 
-  int n = 16384;
+  int n = 4096;
   if (argc >= 3)
     sscanf(argv[2], "%d", &n);
 
-  int k = 16384;
+  int k = 4096;
   if (argc >= 4)
     sscanf(argv[3], "%d", &k);
 
