@@ -48,6 +48,7 @@ namespace cu {
 
 namespace cg = cooperative_groups;
 
+// Fused vectorized dequantize and multiply-add:
 // w_dq = w * scale + bias
 // out = fma(x, w_dq, out)
 template <int N, typename T, typename Q>
@@ -57,21 +58,28 @@ __device__ __forceinline__ void dequant_fma(
     T scale,
     T bias,
     float* out) {
+  // Read x/w into registers.
   auto x_vec = *(reinterpret_cast<const cutlass::AlignedArray<T, N>*>(x));
   auto w_vec = *(reinterpret_cast<const cutlass::AlignedArray<Q, N>*>(w));
+  // Output is assumed to be registers.
   auto* out_vec = reinterpret_cast<cutlass::Array<float, N>*>(out);
 
+  // Dequantize w.
   cutlass::NumericArrayConverter<T, Q, N> converter_tq;
   cutlass::Array<T, N> w_dq = converter_tq(w_vec);
   w_dq = w_dq * scale + bias;
 
+  // Promote x/w to float.
+  static_assert(!cuda::std::is_same_v<T, float>);
   cutlass::NumericArrayConverter<float, T, N> converter_ft;
   cutlass::Array<float, N> x_f = converter_ft(x_vec);
   cutlass::Array<float, N> w_f = converter_ft(w_dq);
 
+  // Multiply and add.
   *out_vec = cutlass::fma(x_f, w_f, *out_vec);
 }
 
+// Specialized for float which does not need promotions.
 template <int N, typename Q>
 __device__ __forceinline__ void dequant_fma(
     const float* x,
@@ -101,7 +109,7 @@ template <
     bool has_residue_k,
     typename T,
     typename Q>
-__global__ void qmv_8bit_kernel(
+__global__ void qmv_kernel(
     const T* x,
     const Q* w,
     const T* scales,
@@ -125,12 +133,16 @@ __global__ void qmv_8bit_kernel(
     return;
   }
 
+  // For sub-byte Q, pointer moves by 8bits for each advance, e.g. w += 1 would
+  // move past 2 elements for 4-bit Q.
+  constexpr int w_step = 8 / cuda::std::min(8, cute::sizeof_bits_v<Q>);
+
   // Advance pointers of x/out.
   x += block.group_index().y * k;
   out += block.group_index().y * n;
 
   // Advance w/scales/biases to current row.
-  w += static_cast<int64_t>(row) * k;
+  w += static_cast<int64_t>(row) * k / w_step;
   scales += static_cast<int64_t>(row) * groups_per_row;
   if constexpr (has_bias) {
     biases += static_cast<int64_t>(row) * groups_per_row;
@@ -145,7 +157,7 @@ __global__ void qmv_8bit_kernel(
     if constexpr (has_bias) {
       bias = biases[idx / group_size];
     }
-    dequant_fma<elems_per_thread>(x + idx, w + idx, scale, bias, sums);
+    dequant_fma<elems_per_thread>(x + idx, w + idx / w_step, scale, bias, sums);
   };
 
   // Loop over k dimension.
@@ -172,13 +184,14 @@ __global__ void qmv_8bit_kernel(
   }
   sum = cg::reduce(warp, sum, cg::plus<float>{});
 
+  // Write result for current warp, which maps to rows 1-to-1.
   if (warp.thread_rank() == 0) {
     out[row] = static_cast<T>(sum);
   }
 }
 
 template <int group_size, bool has_bias, typename T, typename Q, typename F>
-void qmv_8bit(
+void qmv(
     const T* x,
     const Q* w,
     const T* scales,
@@ -194,7 +207,7 @@ void qmv_8bit(
   void* args[] = { &x, &w, &scales, &biases, &out, &n, &k };
 
   dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
-    auto* kernel = &qmv_8bit_kernel<
+    auto* kernel = &qmv_kernel<
         rows_per_block,
         elems_per_thread,
         group_size,
@@ -302,7 +315,7 @@ int main(int argc, char** argv) {
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
   using Element = cutlass::half_t;
-  using Quant = uint8_t;
+  using Quant = int8_t;
 
   constexpr int group_size = 64;
   constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
@@ -353,7 +366,7 @@ int main(int argc, char** argv) {
       stream);
 
   // Run once
-  cu::qmv_8bit<group_size, has_bias>(
+  cu::qmv<group_size, has_bias>(
       d_A.data().get(),
       d_B.data().get(),
       d_S.data().get(),
@@ -406,7 +419,7 @@ int main(int argc, char** argv) {
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cu::qmv_8bit<group_size, has_bias>(
+    cu::qmv<group_size, has_bias>(
         d_A.data().get(),
         d_B.data().get(),
         d_S.data().get(),

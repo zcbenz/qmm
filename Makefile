@@ -5,13 +5,13 @@ INCLUDE_FLAGS = -I cutlass/include -I cutlass/tools/util/include -I cutlass/tool
 FLAGS = $(CUDA_FLAGS) $(CUTLASS_FLAGS) $(INCLUDE_FLAGS)
 
 .PHONY: all
-all: build/gemm build/qmv_8bit
+all: build/gemm build/qmv
 
 build/gemm: gemm.cu
 	mkdir -p build
 	nvcc $< $(FLAGS) -o $@
 
-build/qmv_8bit: qmv_8bit.cu
+build/qmv: qmv.cu
 	mkdir -p build
 	nvcc $< $(FLAGS) -o $@
 
