@@ -173,6 +173,7 @@ template <
     int group_size,
     bool has_bias,
     bool has_residue_k,
+    bool use_smem,
     typename T,
     typename Q>
 __global__ void qmv_8bit_kernel(
@@ -203,35 +204,46 @@ __global__ void qmv_8bit_kernel(
   x += block.group_index().y * k;
   out += block.group_index().y * n;
 
-  // Scales and biases are loaded in shared memory.
   extern __shared__ char shared_buffer[];
-  T* scales_smem = reinterpret_cast<T*>(shared_buffer);
-  [[maybe_unused]] T* biases_smem = nullptr;
-  if constexpr (has_bias) {
-    biases_smem = scales_smem + groups_per_block;
-  }
+  [[maybe_unused]] T* scales_smem;
+  [[maybe_unused]] T* biases_smem;
 
-  // Load scales/biases used by current block.
-  constexpr int block_size = rows_per_block * WARP_SIZE;
-  for (int i = block.thread_rank(); i < groups_per_block; i += block_size) {
-    int t_row = i / groups_per_row;
-    int t_col = i % groups_per_row;
-    int t_n = row_head + t_row;
-    if (t_n < n) {
-      int64_t idx = static_cast<int64_t>(t_n) * groups_per_row + t_col;
-      scales_smem[i] = scales[idx];
-      if constexpr (has_bias) {
-        biases_smem[i] = biases[idx];
+  if constexpr (use_smem) {
+    // Pointers of scales/biases in shared memory.
+    scales_smem = reinterpret_cast<T*>(shared_buffer);
+    if constexpr (has_bias) {
+      biases_smem = scales_smem + groups_per_block;
+    }
+
+    // Load scales/biases used by current block.
+    constexpr int block_size = rows_per_block * WARP_SIZE;
+    for (int i = block.thread_rank(); i < groups_per_block; i += block_size) {
+      int t_row = i / groups_per_row;
+      int t_col = i % groups_per_row;
+      int t_n = row_head + t_row;
+      if (t_n < n) {
+        int64_t idx = static_cast<int64_t>(t_n) * groups_per_row + t_col;
+        scales_smem[i] = scales[idx];
+        if constexpr (has_bias) {
+          biases_smem[i] = biases[idx];
+        }
       }
     }
+    block.sync();
   }
-  block.sync();
 
   // Advance w/scales/biases to current row.
   w += static_cast<int64_t>(row) * k;
-  scales = scales_smem + warp.meta_group_rank() * groups_per_row;
-  if constexpr (has_bias) {
-    biases = biases_smem + warp.meta_group_rank() * groups_per_row;
+  if (use_smem) {
+    scales = scales_smem + warp.meta_group_rank() * groups_per_row;
+    if constexpr (has_bias) {
+      biases = biases_smem + warp.meta_group_rank() * groups_per_row;
+    }
+  } else {
+    scales += static_cast<int64_t>(row) * groups_per_row;
+    if constexpr (has_bias) {
+      biases += static_cast<int64_t>(row) * groups_per_row;
+    }
   }
 
   // Accumulations of current row.
@@ -240,7 +252,7 @@ __global__ void qmv_8bit_kernel(
   // Loop over k dimension.
   constexpr int elems_per_warp = WARP_SIZE * elems_per_thread;
   for (int r = 0; r < k / elems_per_warp; ++r) {
-    int64_t idx = warp.thread_rank() * elems_per_thread + r * elems_per_warp;
+    int idx = warp.thread_rank() * elems_per_thread + r * elems_per_warp;
     // Read quantized weights.
     uint64_t packed_quant = *reinterpret_cast<const uint64_t*>(w + idx);
     // Read scales and biases.
@@ -256,7 +268,7 @@ __global__ void qmv_8bit_kernel(
   if constexpr (has_residue_k) {
     // Handle remaining elements in k dimension.
     int rest = k % elems_per_warp;
-    int64_t idx = warp.thread_rank() * elems_per_thread + k - rest;
+    int idx = warp.thread_rank() * elems_per_thread + k - rest;
     if (idx < k) {
       uint64_t packed_quant = *reinterpret_cast<const uint64_t*>(w + idx);
       T scale = scales[idx / group_size];
@@ -281,7 +293,7 @@ __global__ void qmv_8bit_kernel(
   }
 }
 
-template <int group_size, typename T, typename Q, typename F>
+template <int group_size, bool has_bias, typename T, typename Q, typename F>
 void qmv_8bit(
     const T* x,
     const Q* w,
@@ -291,33 +303,36 @@ void qmv_8bit(
     int m,
     int n,
     int k,
+    size_t smem_bytes_max,
     F&& launch_kernel) {
   constexpr int rows_per_block = 8;
   constexpr int elems_per_thread = 8;
 
-  dim3 num_blocks(cuda::ceil_div(n, rows_per_block), m);
-  dim3 block_dims(WARP_SIZE, rows_per_block);
-
+  // Use shared memory to load scales/biases when there is enough storage.
   int groups_per_row = k / group_size;
-  size_t smem_bytes = (biases ? 2 : 1) * sizeof(T) * groups_per_row * rows_per_block;
+  size_t smem_bytes = (has_bias + 1) * sizeof(T) * groups_per_row * rows_per_block;
+  bool use_smem = smem_bytes <= smem_bytes_max;
 
   void* args[] = { &x, &w, &scales, &biases, &out, &n, &k };
-  dispatch_bool(biases, [&](auto has_bias) {
-    dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
+  dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
+    dispatch_bool(use_smem, [&](auto use_smem) {
       auto* kernel = &qmv_8bit_kernel<
           rows_per_block,
           elems_per_thread,
           group_size,
-          has_bias.value,
+          has_bias,
           has_residue_k.value,
+          use_smem.value,
           cuda_type_t<T>,
           cuda_type_t<Q>>;
+      dim3 num_blocks{cuda::ceil_div(n, rows_per_block), m};
+      dim3 block_dims{WARP_SIZE, rows_per_block};
       launch_kernel(
           reinterpret_cast<void*>(kernel),
           num_blocks,
           block_dims,
           {},
-          smem_bytes,
+          use_smem ? smem_bytes : 0,
           args);
     });
   });
@@ -410,11 +425,11 @@ int main(int argc, char** argv) {
   cudaDeviceProp device_prop;
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
-  using Element = float;
+  using Element = cutlass::half_t;
   using Quant = uint8_t;
 
-  constexpr int group_size = 16;
-  constexpr bool fp_quant = cute::sizeof_bits_v<Quant> <= 8 && cutlass::has_negative_zero_v<Quant>;
+  constexpr int group_size = 64;
+  constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
 
   thrust::device_vector<Element> d_A(m*k*l);
   thrust::device_vector<Quant>   d_B(n*k*l);    // quantized B
@@ -431,12 +446,12 @@ int main(int argc, char** argv) {
       d_B.data().get(), d_B.size(), seed, Quant(0), Quant(6));
   cutlass::reference::device::BlockFillRandomUniform(
       d_S.data().get(), d_S.size(), seed, Element(0.1f), Element(-0.1f));
-  if constexpr (fp_quant) {
-    cutlass::reference::device::BlockFillSequential(
-        d_Z.data().get(), d_Z.size(), Element(0.f), Element(0.f));
-  } else {
+  if constexpr (has_bias) {
     cutlass::reference::device::BlockFillRandomUniform(
         d_Z.data().get(), d_Z.size(), seed, Element(0.1f), Element(-0.1f));
+  } else {
+    cutlass::reference::device::BlockFillSequential(
+        d_Z.data().get(), d_Z.size(), Element(0.f), Element(0.f));
   }
   cutlass::reference::device::BlockFillSequential(
       d_D.data().get(), d_D.size(), Element(-1.f), Element(0.f));
@@ -462,13 +477,14 @@ int main(int argc, char** argv) {
       stream);
 
   // Run once
-  cu::qmv_8bit<group_size>(
+  cu::qmv_8bit<group_size, has_bias>(
       d_A.data().get(),
       d_B.data().get(),
       d_S.data().get(),
-      fp_quant ? nullptr : d_Z.data().get(),
+      d_Z.data().get(),
       d_D.data().get(),
       m, n, k,
+      device_prop.sharedMemPerBlock,
       launch_kernel);
   CUTE_CHECK_LAST();
 
@@ -495,24 +511,44 @@ int main(int argc, char** argv) {
   }
 
 #if 1
+  using cutlass::bits_to_bytes;
+  int64_t qmm_bytes =
+      bits_to_bytes<int64_t>(sizeof_bits_v<Element> * m * k * l) +
+      bits_to_bytes<int64_t>(sizeof_bits_v<Quant>   * k * n * l) +
+      bits_to_bytes<int64_t>(sizeof_bits_v<Element> * k * n * l / group_size) +
+      bits_to_bytes<int64_t>(sizeof_bits_v<Element> * k * n * l / group_size) +
+      bits_to_bytes<int64_t>(sizeof_bits_v<Element> * m * n * l);
+  const double qmm_gibs = qmm_bytes * 1e-9;
+  int64_t gemm_bytes =
+      bits_to_bytes<int64_t>(sizeof_bits_v<Element> * m * k * l) +
+      bits_to_bytes<int64_t>(sizeof_bits_v<Element> * k * n * l) +
+      bits_to_bytes<int64_t>(sizeof_bits_v<Element> * m * n * l);
+  const double gemm_gibs = gemm_bytes * 1e-9;
+  const double tflops = (2.0 * m * n * k * l) * 1e-12;
+
+  printf("bytes ratio: %f\n", float(gemm_bytes) / float(qmm_bytes));
+
   // Timing iterations
   const int timing_iterations = 100;
-  const double tflops = (2.0 * m * n * k) * 1e-12;
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cu::qmv_8bit<group_size>(
+    cu::qmv_8bit<group_size, has_bias>(
         d_A.data().get(),
         d_B.data().get(),
         d_S.data().get(),
-        fp_quant ? nullptr : d_Z.data().get(),
+        d_Z.data().get(),
         d_D.data().get(),
         m, n, k,
+        device_prop.sharedMemPerBlock,
         launch_kernel);
   }
   double cute_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
-  printf("CUTE:    [%5.2f]TFlop/s  (%6.4f)ms\n", tflops / cute_time, cute_time*1000);
+  printf("QMV:     [%5.2f]TFlop/s  [%6.1f]GiB/s  (%6.4f)ms\n",
+         tflops / cute_time,
+         qmm_gibs / cute_time,
+         cute_time * 1000);
 
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
@@ -525,7 +561,10 @@ int main(int argc, char** argv) {
   }
   double cublas_time = timer.seconds() / timing_iterations;
   CUTE_CHECK_LAST();
-  printf("CUBLAS:  [%5.2f]TFlop/s  (%6.4f)ms\n", tflops / cublas_time, cublas_time*1000);
+  printf("CUBLAS:  [%5.2f]TFlop/s  [%6.1f]GiB/s  (%6.4f)ms\n",
+         tflops / cublas_time,
+         gemm_gibs / cublas_time,
+         cublas_time * 1000);
 
   printf("Speedup: [%5.2f]x\n", cublas_time / cute_time);
 #endif
