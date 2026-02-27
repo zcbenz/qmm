@@ -1,6 +1,5 @@
 #include <cublas_v2.h>
 #include <cute/layout.hpp>
-#include <cute/numeric/numeric_types.hpp>
 #include <cutlass/util/GPU_Clock.hpp>
 #include <cutlass/util/reference/device/tensor_fill.h>
 #include <cutlass/util/reference/device/tensor_compare.h>
@@ -10,30 +9,12 @@
 
 #include <type_traits>
 
-#include <cutlass/numeric_conversion.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cute/numeric/numeric_types.hpp>
+#include <cutlass/numeric_conversion.h>
 
 #define WARP_SIZE 32
-
-// Maps CPU types to CUDA types.
-template <typename T>
-struct CTypeToCudaType {
-  using type = T;
-};
-
-template <>
-struct CTypeToCudaType<cutlass::half_t> {
-  using type = __half;
-};
-
-template <>
-struct CTypeToCudaType<cutlass::bfloat16_t> {
-  using type = __nv_bfloat16;
-};
-
-template <typename T>
-using cuda_type_t = typename CTypeToCudaType<T>::type;
 
 template <typename F>
 void dispatch_bool(bool v, F&& f) {
@@ -52,12 +33,35 @@ namespace cg = cooperative_groups;
 // w_dq = w * scale + bias
 // out = fma(x, w_dq, out)
 template <int N, typename T, typename Q>
-__device__ __forceinline__ void dequant_fma(
-    const T* x,
-    const Q* w,
-    T scale,
-    T bias,
-    float* out) {
+__device__ __forceinline__ void
+dequant_fma(const T* x, const Q* w, T scale, T bias, T* out) {
+  // Read x/w into registers.
+  auto x_vec = *(reinterpret_cast<const cutlass::AlignedArray<T, N>*>(x));
+  auto w_vec = *(reinterpret_cast<const cutlass::AlignedArray<Q, N>*>(w));
+  // Output is assumed to be registers.
+  auto* out_vec = reinterpret_cast<cutlass::Array<T, N>*>(out);
+
+  // Dequantize w.
+  cutlass::NumericArrayConverter<T, Q, N> converter_tq;
+  cutlass::Array<T, N> w_dq = converter_tq(w_vec);
+  if constexpr (cuda::std::is_same_v<T, float>) {
+    // There is no vectorized scalar multiply/add for float32.
+    #pragma unroll
+    for (int i = 0; i < N; ++i) {
+      w_dq[i] = w_dq[i] * scale + bias;
+    }
+  } else {
+    w_dq = w_dq * scale + bias;
+  }
+
+  // Multiply and add.
+  *out_vec = cutlass::fma(x_vec, w_dq, *out_vec);
+}
+
+template <int N, typename T, typename Q,
+          typename = cuda::std::enable_if_t<!cuda::std::is_same_v<T, float>>>
+__device__ __forceinline__ void
+dequant_fma(const T* x, const Q* w, T scale, T bias, float* out) {
   // Read x/w into registers.
   auto x_vec = *(reinterpret_cast<const cutlass::AlignedArray<T, N>*>(x));
   auto w_vec = *(reinterpret_cast<const cutlass::AlignedArray<Q, N>*>(w));
@@ -79,28 +83,6 @@ __device__ __forceinline__ void dequant_fma(
   *out_vec = cutlass::fma(x_f, w_f, *out_vec);
 }
 
-// Specialized for float which does not need promotions.
-template <int N, typename Q>
-__device__ __forceinline__ void dequant_fma(
-    const float* x,
-    const Q* w,
-    float scale,
-    float bias,
-    float* out) {
-  auto x_vec = *(reinterpret_cast<const cutlass::AlignedArray<float, N>*>(x));
-  auto w_vec = *(reinterpret_cast<const cutlass::AlignedArray<Q, N>*>(w));
-  auto* out_vec = reinterpret_cast<cutlass::Array<float, N>*>(out);
-
-  cutlass::NumericArrayConverter<float, Q, N> converter;
-  cutlass::Array<float, N> w_dq = converter(w_vec);
-#pragma unroll
-  for (int i = 0; i < N; ++i) {
-    w_dq[i] = w_dq[i] * scale + bias;
-  }
-
-  *out_vec = cutlass::fma(x_vec, w_dq, *out_vec);
-}
-
 template <
     int rows_per_block,
     int elems_per_thread,
@@ -120,26 +102,23 @@ __global__ void qmv_kernel(
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
-  // How many groups (and scales/biases) in a row/block.
-  int groups_per_row = k / group_size;
-  int groups_per_block = rows_per_block * groups_per_row;
-
-  // The start of row that this block handles.
-  int row_head = block.group_index().x * rows_per_block;
-
   // The row that this warp handles.
-  int row = row_head + warp.meta_group_rank(); // [0, n)
+  int row = block.group_index().x * rows_per_block + warp.meta_group_rank();
   if (row >= n) {
     return;
   }
 
-  // For sub-byte Q, pointer moves by 8bits for each advance, e.g. w += 1 would
-  // move past 2 elements for 4-bit Q.
-  constexpr int w_step = 8 / cuda::std::min(8, cute::sizeof_bits_v<Q>);
-
   // Advance pointers of x/out.
   x += block.group_index().y * k;
   out += block.group_index().y * n;
+
+  // For sub-byte Q, pointer moves by 8bits for each advance, e.g. w += 1 would
+  // move past 2 elements for 4-bit Q.
+  constexpr int bits = cute::sizeof_bits_v<Q>;
+  constexpr int w_step = 8 / cuda::std::min(8, bits);
+
+  // How many groups (and scales/biases) in a row.
+  int groups_per_row = k / group_size;
 
   // Advance w/scales/biases to current row.
   w += static_cast<int64_t>(row) * k / w_step;
@@ -149,7 +128,7 @@ __global__ void qmv_kernel(
   }
 
   // Accumulations of current row.
-  float sums[elems_per_thread] = {};
+  cuda::std::conditional_t<(bits >= 8), float, T> sums[elems_per_thread] = {};
 
   auto dequant_fma_tile = [&](int idx) {
     T scale = scales[idx / group_size];
@@ -202,9 +181,11 @@ void qmv(
     int k,
     F&& launch_kernel) {
   constexpr int rows_per_block = 8;
-  constexpr int elems_per_thread = 8;
+  constexpr int elems_per_thread = std::min(128 / cute::sizeof_bits_v<Q>, 16);
 
-  void* args[] = { &x, &w, &scales, &biases, &out, &n, &k };
+  dim3 num_blocks{uint32_t(cuda::ceil_div(n, rows_per_block)), uint32_t(m)};
+  dim3 block_dims{WARP_SIZE, rows_per_block};
+  void* args[] = {&x, &w, &scales, &biases, &out, &n, &k};
 
   dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
     auto* kernel = &qmv_kernel<
@@ -213,17 +194,10 @@ void qmv(
         group_size,
         has_bias,
         has_residue_k.value,
-        cuda_type_t<T>,
-        cuda_type_t<Q>>;
-    dim3 num_blocks{cuda::ceil_div(n, rows_per_block), m};
-    dim3 block_dims{WARP_SIZE, rows_per_block};
+        T,
+        Q>;
     launch_kernel(
-        reinterpret_cast<void*>(kernel),
-        num_blocks,
-        block_dims,
-        {},
-        0,
-        args);
+        reinterpret_cast<void*>(kernel), num_blocks, block_dims, args);
   });
 }
 
@@ -279,11 +253,10 @@ void cublas_gemm(char transA, char transB,
   }
 }
 
-void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, dim3 cluster, size_t smem_bytes, void** args) {
+void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, void** args) {
   cudaLaunchConfig_t config = {};
   config.gridDim = num_blocks;
   config.blockDim = block_dims;
-  config.dynamicSmemBytes = smem_bytes;
   config.stream = nullptr;
   cudaLaunchKernelExC(&config, func, args);
 }
@@ -315,7 +288,7 @@ int main(int argc, char** argv) {
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
   using Element = cutlass::half_t;
-  using Quant = int8_t;
+  using Quant = cutlass::uint4b_t;
 
   constexpr int group_size = 64;
   constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
