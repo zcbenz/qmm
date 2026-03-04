@@ -156,6 +156,7 @@ __global__ void qmm_sm80_kernel(
     tCpC(m,0) = get<0>(tCcC(0,m,0)) < m_max_coord;
   }
 
+  auto K_PIPE_MAX = size<3>(tAsA);
   int smem_pipe_read = 0;
   int smem_pipe_write = 0;
 
@@ -164,7 +165,7 @@ __global__ void qmm_sm80_kernel(
     copy(g2s_copy_a, tAgA(_,_,_,tile), tAsA(_,_,_,smem_pipe_write));
     copy(g2s_copy_b, tBgB(_,_,_,tile), tBsB(_,_,_,smem_pipe_write));
     cp_async_fence();
-    smem_pipe_write = (smem_pipe_write + 1) % 2;
+    smem_pipe_write = (smem_pipe_write + 1) % K_PIPE_MAX;
   };
 #if !USE_GEMM
   // Copy S/Z: GMEM => RMEM.
@@ -174,7 +175,7 @@ __global__ void qmm_sm80_kernel(
   };
 #endif
   // Copy A/B: SMEM => RMEM.
-  auto fetch_smem = [&](int block) {
+  auto fetch_smem = [&](auto block) {
     copy(s2r_atom_a, s2r_tCsA(_,_,block,smem_pipe_read), s2r_tCrA(_,_,block));
     copy(s2r_atom_b, s2r_tCsB(_,_,block,smem_pipe_read), s2r_tCrB(_,_,block));
 #if !USE_GEMM
@@ -189,22 +190,28 @@ __global__ void qmm_sm80_kernel(
 #endif
   };
 
-  // Prefetch first tile.
-  fetch_gmem(0);
+  auto K_TILE_MAX = size<3>(tAgA);
+  auto K_BLOCK_MAX = size<2>(tCrA);
+
+  // Prefetch beginning tiles.
+  CUTE_UNROLL
+  int tile_pipe = 0;
+  for (; tile_pipe < K_PIPE_MAX - 1; ++tile_pipe) {
+    fetch_gmem(tile_pipe);
+  }
 
   // Clear accumulators.
   clear(tCrC_accu);
 
-  // Save first tile to SMEM and prefetch first block.
-  cp_async_wait<0>();
-  __syncthreads();
+  // Prefetch first block.
+  if constexpr (K_BLOCK_MAX > 1) {
+    cp_async_wait<K_PIPE_MAX - 2>();
+    __syncthreads();
 #if !USE_GEMM
-  fetch_scales(0);
+    fetch_scales(0);
 #endif
-  fetch_smem(0);
-
-  auto K_TILE_MAX  = size<3>(tAgA);
-  auto K_BLOCK_MAX = size<2>(tCrA);
+    fetch_smem(Int<0>{});
+  }
 
   // Loop over CTA tiles.
   for (int tile = 0; tile < K_TILE_MAX; ++tile) {
@@ -212,20 +219,20 @@ __global__ void qmm_sm80_kernel(
     CUTE_UNROLL
     for (int block = 0; block < K_BLOCK_MAX; ++block) {
       // Wait for last tile.
-      int tile_next = (tile + 1 < K_TILE_MAX) ? tile + 1 : tile;
       if (block == K_BLOCK_MAX - 1) {
-        smem_pipe_read = (smem_pipe_read + 1) % 2;
-        cp_async_wait<0>();
+        smem_pipe_read = (smem_pipe_read + 1) % K_PIPE_MAX;
+        cp_async_wait<K_PIPE_MAX - 2>();
         __syncthreads();
 #if !USE_GEMM
-        fetch_scales(tile_next);
+        fetch_scales((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
 #endif
       }
       // Prefetch next block.
-      fetch_smem((block + 1) % K_BLOCK_MAX);
+      fetch_smem((block + Int<1>{}) % K_BLOCK_MAX);
       // Prefetch next tile.
       if (block == 0) {
-        fetch_gmem(tile_next);
+        fetch_gmem(tile_pipe);
+        tile_pipe = (tile_pipe + 1 < K_TILE_MAX) ? tile_pipe + 1 : tile_pipe;
       }
       // MMA.
 #if USE_GEMM
@@ -295,7 +302,7 @@ void qmm_sm80(
   auto swizzle_ab = composition(Swizzle<3,3,3>{},
                                 Layout<Shape <_8,Shape <_8, _8>>,
                                        Stride<_8,Stride<_1,_64>>>{});
-  auto bP = Int<2>{}; // pipeline
+  auto bP = Int<3>{}; // pipeline
   auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM, bK, bP));
   auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN, bK, bP));
 
@@ -313,16 +320,14 @@ void qmm_sm80(
       make_stride(k / group_size, Stride<_0, _1>{}, n * k / group_size));
 
   // Atoms.
-  constexpr int act_load = 128;
-  constexpr int act_bits = sizeof_bits_v<Element>;
-  constexpr int qua_load = act_load / (act_bits / sizeof_bits_v<Quant>);
-  TiledCopy g2s_copy_a = make_tiled_copy<Element, act_load, SM80_CP_ASYNC_CACHEALWAYS>(num_threads, bK);
+  constexpr int quant_load_bits = 128 / (sizeof_bits_v<Element> / sizeof_bits_v<Quant>);
+  TiledCopy g2s_copy_a = make_tiled_copy<Element, 128, SM80_CP_ASYNC_CACHEALWAYS>(num_threads, bK);
 #if USE_GEMM
-  TiledCopy g2s_copy_b = make_tiled_copy<Element, act_load, SM80_CP_ASYNC_CACHEALWAYS>(num_threads, bK);
+  TiledCopy g2s_copy_b = make_tiled_copy<Element, 128, SM80_CP_ASYNC_CACHEALWAYS>(num_threads, bK);
 #else
-  TiledCopy g2s_copy_b = make_tiled_copy<Quant,   qua_load, SM80_CP_ASYNC_CACHEALWAYS>(num_threads, bK);
+  TiledCopy g2s_copy_b = make_tiled_copy<Quant, quant_load_bits, SM80_CP_ASYNC_CACHEALWAYS>(num_threads, bK);
 #endif
-  TiledCopy s2g_copy_c = make_tiled_copy<Element, act_load, UniversalCopy>(num_threads, bN);
+  TiledCopy s2g_copy_c = make_tiled_copy<Element, 128, UniversalCopy>(num_threads, bN);
 
   Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
 #if USE_GEMM
