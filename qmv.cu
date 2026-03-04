@@ -45,8 +45,7 @@ dequant_fma(const T* x, const Q* w, T scale, T bias, T* out) {
   cutlass::NumericArrayConverter<T, Q, N> converter_tq;
   cutlass::Array<T, N> w_dq = converter_tq(w_vec);
   if constexpr (cuda::std::is_same_v<T, float>) {
-    // There is no vectorized scalar multiply/add for float32.
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < N; ++i) {
       w_dq[i] = w_dq[i] * scale + bias;
     }
@@ -58,8 +57,12 @@ dequant_fma(const T* x, const Q* w, T scale, T bias, T* out) {
   *out_vec = cutlass::fma(x_vec, w_dq, *out_vec);
 }
 
-template <int N, typename T, typename Q,
-          typename = cuda::std::enable_if_t<!cuda::std::is_same_v<T, float>>>
+// Specialization for doing float32 accumulations on narrow types.
+template <
+    int N,
+    typename T,
+    typename Q,
+    typename = cuda::std::enable_if_t<!cuda::std::is_same_v<T, float>>>
 __device__ __forceinline__ void
 dequant_fma(const T* x, const Q* w, T scale, T bias, float* out) {
   // Read x/w into registers.
@@ -181,7 +184,8 @@ void qmv(
     int k,
     F&& launch_kernel) {
   constexpr int rows_per_block = 8;
-  constexpr int elems_per_thread = std::min(128 / cute::sizeof_bits_v<Q>, 16);
+  constexpr int elems_per_thread =
+      (cute::sizeof_bits_v<T> <= 16 && cute::sizeof_bits_v<Q> <= 4) ? 16 : 8;
 
   dim3 num_blocks{uint32_t(cuda::ceil_div(n, rows_per_block)), uint32_t(m)};
   dim3 block_dims{WARP_SIZE, rows_per_block};
