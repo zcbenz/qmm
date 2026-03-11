@@ -25,6 +25,105 @@ void dispatch_bool(bool v, F&& f) {
   }
 }
 
+namespace cutlass {
+
+using uint3b_t = integer_subbyte<3, false>;
+using uint5b_t = integer_subbyte<5, false>;
+
+template <typename T, int N, FloatRoundStyle Round>
+struct NumericArrayConverter<T, uint3b_t, N, Round> {
+  static_assert(N % 8 == 0);
+
+  using result_type = Array<T, N>;
+  using source_type = Array<uint3b_t, N>;
+
+  CUTLASS_HOST_DEVICE
+  static result_type convert(const source_type& source) {
+    result_type result;
+    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N / 8; ++i) {
+      auto* s = s_base + i * 3;
+      result[i * 8] = T(s[0] & 0x07);
+      result[i * 8 + 1] = T((s[0] & 0x38) >> 3);
+      result[i * 8 + 2] = T((s[0] & 0xc0) >> 6) + T((s[1] & 0x01) << 2);
+      result[i * 8 + 3] = T((s[1] & 0x0e) >> 1);
+      result[i * 8 + 4] = T((s[1] & 0x70) >> 4);
+      result[i * 8 + 5] = T((s[1] & 0x80) >> 7) + T((s[2] & 0x03) << 1);
+      result[i * 8 + 6] = T((s[2] & 0x1c) >> 2);
+      result[i * 8 + 7] = T((s[2] & 0xe0) >> 5);
+    }
+    return result;
+  }
+
+  CUTLASS_HOST_DEVICE
+  result_type operator()(const source_type& s) const {
+    return convert(s);
+  }
+};
+
+template <typename T, int N, FloatRoundStyle Round>
+struct NumericArrayConverter<T, uint5b_t, N, Round> {
+  static_assert(N % 8 == 0);
+
+  using result_type = Array<T, N>;
+  using source_type = Array<uint5b_t, N>;
+
+  CUTLASS_HOST_DEVICE
+  static result_type convert(const source_type& source) {
+    result_type result;
+    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N / 8; ++i) {
+      auto* s = s_base + i * 5;
+      result[i * 8] = T(s[0] & 0x1f);
+      result[i * 8 + 1] = T((s[0] & 0xe0) >> 5) + T((s[1] & 0x03) << 3);
+      result[i * 8 + 2] = T((s[1] & 0x7c) >> 2);
+      result[i * 8 + 3] = T((s[1] & 0x80) >> 7) + T((s[2] & 0x0f) << 1);
+      result[i * 8 + 4] = T((s[2] & 0xf0) >> 4) + T((s[3] & 0x01) << 4);
+      result[i * 8 + 5] = T((s[3] & 0x3e) >> 1);
+      result[i * 8 + 6] = T((s[3] & 0xc0) >> 6) + T((s[4] & 0x07) << 2);
+      result[i * 8 + 7] = T((s[4] & 0xf8) >> 3);
+    }
+    return result;
+  }
+
+  CUTLASS_HOST_DEVICE
+  result_type operator()(const source_type& s) const {
+    return convert(s);
+  }
+};
+
+template <typename T, int N, FloatRoundStyle Round>
+struct NumericArrayConverter<T, uint6b_t, N, Round> {
+  static_assert(N % 4 == 0);
+
+  using result_type = Array<T, N>;
+  using source_type = Array<uint6b_t, N>;
+
+  CUTLASS_HOST_DEVICE
+  static result_type convert(const source_type& source) {
+    result_type result;
+    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N / 4; ++i) {
+      auto* s = s_base + i * 3;
+      result[i * 4] = T(s[0] & 0x3f);
+      result[i * 4 + 1] = T((s[0] >> 6) & 0x03) + T((s[1] & 0x0f) << 2);
+      result[i * 4 + 2] = T((s[1] >> 4) & 0x0f) + T((s[2] & 0x03) << 4);
+      result[i * 4 + 3] = T((s[2] >> 2) & 0x3f);
+    }
+    return result;
+  }
+
+  CUTLASS_HOST_DEVICE
+  result_type operator()(const source_type& s) const {
+    return convert(s);
+  }
+};
+
+} // namespace cutlass
+
 namespace cu {
 
 namespace cg = cooperative_groups;
@@ -32,25 +131,29 @@ namespace cg = cooperative_groups;
 // Fused vectorized dequantize and multiply-add:
 // w_dq = w * scale + bias
 // out = fma(x, w_dq, out)
-template <int N, typename T, typename Q>
+template <int N, bool has_bias, typename T, typename Q, typename S>
 __device__ __forceinline__ void
-dequant_fma(const T* x, const Q* w, T scale, T bias, T* out) {
+dequant_fma(const T* x, const Q* w, S scale, T bias, T* out) {
   // Read x/w into registers.
-  auto x_vec = *(reinterpret_cast<const cutlass::AlignedArray<T, N>*>(x));
-  auto w_vec = *(reinterpret_cast<const cutlass::AlignedArray<Q, N>*>(w));
+  auto x_vec = *(reinterpret_cast<const cutlass::Array<T, N>*>(x));
+  auto w_vec = *(reinterpret_cast<const cutlass::Array<Q, N>*>(w));
   // Output is assumed to be registers.
   auto* out_vec = reinterpret_cast<cutlass::Array<T, N>*>(out);
 
   // Dequantize w.
   cutlass::NumericArrayConverter<T, Q, N> converter_tq;
   cutlass::Array<T, N> w_dq = converter_tq(w_vec);
-  if constexpr (cuda::std::is_same_v<T, float>) {
+  if constexpr (has_bias) {
+    if constexpr (cuda::std::is_same_v<T, float>) {
 #pragma unroll
-    for (int i = 0; i < N; ++i) {
-      w_dq[i] = w_dq[i] * scale + bias;
+      for (int i = 0; i < N; ++i) {
+        w_dq[i] = w_dq[i] * T(scale) + bias;
+      }
+    } else {
+      w_dq = w_dq * T(scale) + bias;
     }
   } else {
-    w_dq = w_dq * scale + bias;
+    w_dq = w_dq * T(scale);
   }
 
   // Multiply and add.
@@ -60,21 +163,27 @@ dequant_fma(const T* x, const Q* w, T scale, T bias, T* out) {
 // Specialization for doing float32 accumulations on narrow types.
 template <
     int N,
+    bool has_bias,
     typename T,
     typename Q,
+    typename S,
     typename = cuda::std::enable_if_t<!cuda::std::is_same_v<T, float>>>
 __device__ __forceinline__ void
-dequant_fma(const T* x, const Q* w, T scale, T bias, float* out) {
+dequant_fma(const T* x, const Q* w, S scale, T bias, float* out) {
   // Read x/w into registers.
-  auto x_vec = *(reinterpret_cast<const cutlass::AlignedArray<T, N>*>(x));
-  auto w_vec = *(reinterpret_cast<const cutlass::AlignedArray<Q, N>*>(w));
+  auto x_vec = *(reinterpret_cast<const cutlass::Array<T, N>*>(x));
+  auto w_vec = *(reinterpret_cast<const cutlass::Array<Q, N>*>(w));
   // Output is assumed to be registers.
   auto* out_vec = reinterpret_cast<cutlass::Array<float, N>*>(out);
 
   // Dequantize w.
   cutlass::NumericArrayConverter<T, Q, N> converter_tq;
   cutlass::Array<T, N> w_dq = converter_tq(w_vec);
-  w_dq = w_dq * scale + bias;
+  if constexpr (has_bias) {
+    w_dq = w_dq * T(scale) + bias;
+  } else {
+    w_dq = w_dq * T(scale);
+  }
 
   // Promote x/w to float.
   static_assert(!cuda::std::is_same_v<T, float>);
@@ -93,15 +202,18 @@ template <
     bool has_bias,
     bool has_residue_k,
     typename T,
-    typename Q>
+    typename Q,
+    typename S>
 __global__ void qmv_kernel(
     const T* x,
     const Q* w,
-    const T* scales,
+    const S* scales,
     const T* biases,
     T* out,
     int n,
-    int k) {
+    int k,
+    bool broadcast_w) {
+  auto grid = cg::this_grid();
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
@@ -112,34 +224,38 @@ __global__ void qmv_kernel(
   }
 
   // Advance pointers of x/out.
-  x += block.group_index().y * k;
-  out += block.group_index().y * n;
+  int m = grid.dim_blocks().y;
+  int l = block.group_index().z;
+  x += block.group_index().y * k + m * k * l;
+  out += block.group_index().y * n + m * n * l;
 
   // For sub-byte Q, pointer moves by 8bits for each advance, e.g. w += 1 would
   // move past 2 elements for 4-bit Q.
   constexpr int bits = cute::sizeof_bits_v<Q>;
-  constexpr int w_step = 8 / cuda::std::min(8, bits);
+  auto w_step = [&](int idx) { return idx * cuda::std::min(8, bits) / 8; };
 
   // How many groups (and scales/biases) in a row.
   int groups_per_row = k / group_size;
 
   // Advance w/scales/biases to current row.
-  w += static_cast<int64_t>(row) * k / w_step;
-  scales += static_cast<int64_t>(row) * groups_per_row;
+  int w_batch = broadcast_w ? 0 : l;
+  w += (static_cast<int64_t>(row) + n * w_batch) * w_step(k);
+  scales += (static_cast<int64_t>(row) + n * w_batch) * groups_per_row;
   if constexpr (has_bias) {
-    biases += static_cast<int64_t>(row) * groups_per_row;
+    biases += (static_cast<int64_t>(row) + n * w_batch) * groups_per_row;
   }
 
   // Accumulations of current row.
   cuda::std::conditional_t<(bits >= 8), float, T> sums[elems_per_thread] = {};
 
   auto dequant_fma_tile = [&](int idx) {
-    T scale = scales[idx / group_size];
+    S scale = scales[idx / group_size];
     T bias{0};
     if constexpr (has_bias) {
       bias = biases[idx / group_size];
     }
-    dequant_fma<elems_per_thread>(x + idx, w + idx / w_step, scale, bias, sums);
+    dequant_fma<elems_per_thread, has_bias>(
+        x + idx, w + w_step(idx), scale, bias, sums);
   };
 
   // Loop over k dimension.
@@ -172,24 +288,33 @@ __global__ void qmv_kernel(
   }
 }
 
-template <int group_size, bool has_bias, typename T, typename Q, typename F>
+template <
+    int group_size,
+    bool has_bias,
+    typename T,
+    typename Q,
+    typename S,
+    typename F>
 void qmv(
     const T* x,
     const Q* w,
-    const T* scales,
+    const S* scales,
     const T* biases,
     T* out,
     int m,
     int n,
     int k,
+    int l,
+    bool broadcast_w,
     F&& launch_kernel) {
   constexpr int rows_per_block = 8;
   constexpr int elems_per_thread =
       (cute::sizeof_bits_v<T> <= 16 && cute::sizeof_bits_v<Q> <= 4) ? 16 : 8;
 
-  dim3 num_blocks{uint32_t(cuda::ceil_div(n, rows_per_block)), uint32_t(m)};
+  dim3 num_blocks{
+      uint32_t(cuda::ceil_div(n, rows_per_block)), uint32_t(m), uint32_t(l)};
   dim3 block_dims{WARP_SIZE, rows_per_block};
-  void* args[] = {&x, &w, &scales, &biases, &out, &n, &k};
+  void* args[] = {&x, &w, &scales, &biases, &out, &n, &k, &broadcast_w};
 
   dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
     auto* kernel = &qmv_kernel<
@@ -199,7 +324,8 @@ void qmv(
         has_bias,
         has_residue_k.value,
         T,
-        Q>;
+        Q,
+        S>;
     launch_kernel(
         reinterpret_cast<void*>(kernel), num_blocks, block_dims, args);
   });
@@ -292,15 +418,16 @@ int main(int argc, char** argv) {
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
   using Element = cutlass::half_t;
-  using Quant = cutlass::uint4b_t;
+  using Quant = cutlass::float_e2m1_t;
+  using Scale = Element;
 
-  constexpr int group_size = 64;
+  constexpr int group_size = 32;
   constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
 
   thrust::device_vector<Element> d_A(m*k*l);
   thrust::device_vector<Quant>   d_B(n*k*l);    // quantized B
   thrust::device_vector<Element> d_B_dq(n*k*l); // dequantized B
-  thrust::device_vector<Element> d_S(n*k*l/group_size); // scales
+  thrust::device_vector<Scale> d_S(n*k*l/group_size); // scales
   thrust::device_vector<Element> d_Z(n*k*l/group_size); // zero points
   thrust::device_vector<Element> d_D(m*n*l);
   thrust::device_vector<Element> d_D_ref(m*n*l);
@@ -311,7 +438,7 @@ int main(int argc, char** argv) {
   cutlass::reference::device::BlockFillRandomUniform(
       d_B.data().get(), d_B.size(), seed, Quant(0), Quant(6));
   cutlass::reference::device::BlockFillRandomUniform(
-      d_S.data().get(), d_S.size(), seed, Element(0.1f), Element(-0.1f));
+      d_S.data().get(), d_S.size(), seed, Scale(0.1f), Scale(-0.1f));
   if constexpr (has_bias) {
     cutlass::reference::device::BlockFillRandomUniform(
         d_Z.data().get(), d_Z.size(), seed, Element(0.1f), Element(-0.1f));
@@ -349,7 +476,7 @@ int main(int argc, char** argv) {
       d_S.data().get(),
       d_Z.data().get(),
       d_D.data().get(),
-      m, n, k,
+      m, n, k, l, false,
       launch_kernel);
   CUTE_CHECK_LAST();
 
@@ -402,7 +529,7 @@ int main(int argc, char** argv) {
         d_S.data().get(),
         d_Z.data().get(),
         d_D.data().get(),
-        m, n, k,
+        m, n, k, l, false,
         launch_kernel);
   }
   double cute_time = timer.seconds() / timing_iterations;
