@@ -30,15 +30,13 @@ template <typename ProblemShape, typename CtaTiler,
           typename StrideA, typename SmemLayoutA, typename TiledCopyA, typename S2RAtomA,
           typename StrideB, typename SmemLayoutB, typename TiledCopyB, typename S2RAtomB,
           typename StrideC, typename SmemLayoutC, typename TiledCopyC, typename R2SAtomC,
-          typename LayoutS, typename TiledCopyS,
-          typename TiledMma>
+          typename LayoutS, typename TiledMma>
 __global__ void qmm_sm75_kernel(
     ProblemShape shape_MNKL, CtaTiler cta_tiler,
     const Element* A, StrideA dA, SmemLayoutA sA_layout, TiledCopyA g2s_copy_a, S2RAtomA s2r_atom_a,
     const Quant*   B, StrideB dB, SmemLayoutB sB_layout, TiledCopyB g2s_copy_b, S2RAtomB s2r_atom_b,
           Element* C, StrideC dC, SmemLayoutC sC_layout, TiledCopyC s2g_copy_c, R2SAtomC r2s_atom_c,
-    const Element* S, const Element* Z, LayoutS S_layout, TiledCopyS g2r_copy_s,
-    TiledMma mma) {
+    const Element* S, const Element* Z, LayoutS S_layout, TiledMma mma) {
   CUTE_STATIC_ASSERT_V(size(g2s_copy_a) == size(mma));
   CUTE_STATIC_ASSERT_V(size(g2s_copy_b) == size(mma));
   CUTE_STATIC_ASSERT_V(size(s2g_copy_c) == size(mma));
@@ -148,7 +146,7 @@ __global__ void qmm_sm75_kernel(
   CUTE_UNROLL
   for (int m = 0; m < size<0>(tCpC); ++m) {
     CUTE_UNROLL
-    for (int n = 0; n < size<0>(tCpC); ++n) {
+    for (int n = 0; n < size<1>(tCpC); ++n) {
       tCpC(m,n) = elem_less(tCcC(0,m,n), make_coord(m_max_coord, n_max_coord));
     }
   }
@@ -220,15 +218,12 @@ __global__ void qmm_sm75_kernel(
   copy_if(s2g_copy_c, tCpC, s2g_tCsC, s2g_tCgC);
 }
 
-template <typename Element, int bits, typename NumThreads, typename BlockSize>
-inline auto make_tiled_copy(NumThreads num_threads, BlockSize block_size) {
-  constexpr auto elems_per_copy = Int<bits / sizeof_bits_v<Element>>{};
-  constexpr auto thrs_per_block = Int<block_size / elems_per_copy>{};
-  constexpr auto rest_threads = Int<num_threads / thrs_per_block>{};
+template <typename T, int bits, typename NumThreads>
+inline auto make_tiled_copy(NumThreads num_threads) {
   return make_tiled_copy(
-      Copy_Atom<UniversalCopy<uint_bit_t<bits>>, Element>{},
-      make_layout(make_shape(rest_threads, thrs_per_block), LayoutRight{}),
-      make_layout(make_shape(Int<1>{}, elems_per_copy)));
+      Copy_Atom<UniversalCopy<uint_bit_t<bits>>, T>{},
+      make_layout(make_shape(Int<num_threads / 8>{}, Int<8>{}), LayoutRight{}),
+      make_layout(make_shape(Int<1>{}, Int<bits / sizeof_bits_v<T>>{})));
 }
 
 template <typename Element, typename Quant, typename GroupSize, typename F>
@@ -285,13 +280,9 @@ void qmm_sm75(
       make_stride(k / group_size, Stride<_0, _1>{}, n * k / group_size));
 
   // Atoms.
-  constexpr int act_load = 128;
-  constexpr int act_bits = sizeof_bits_v<Element>;
-  constexpr int qua_load = act_load / (act_bits / sizeof_bits_v<Quant>);
-  TiledCopy g2s_copy_a = make_tiled_copy<Element, act_load>(num_threads, bK);
-  TiledCopy g2s_copy_b = make_tiled_copy<Quant,   qua_load>(num_threads, bK);
-  TiledCopy s2g_copy_c = make_tiled_copy<Element, act_load>(num_threads, bN);
-  TiledCopy g2r_copy_s = make_tiled_copy<Element, act_bits>(num_threads, bS);
+  TiledCopy g2s_copy_a = make_tiled_copy<Element, 128>(num_threads);
+  TiledCopy g2s_copy_b = make_tiled_copy<Quant, 32>(num_threads);
+  TiledCopy s2g_copy_c = make_tiled_copy<Element, 128>(num_threads);
 
   Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
   Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_b;
@@ -303,8 +294,7 @@ void qmm_sm75(
       decltype(dA), decltype(sA_layout), decltype(g2s_copy_a), decltype(s2r_atom_a),
       decltype(dB), decltype(sB_layout), decltype(g2s_copy_b), decltype(s2r_atom_b),
       decltype(dC), decltype(sC_layout), decltype(s2g_copy_c), decltype(r2s_atom_c),
-      decltype(S_layout), decltype(g2r_copy_s),
-      decltype(mma)>;
+      decltype(S_layout), decltype(mma)>;
 
   // Set L1 to be SMEM only.
   size_t smem_bytes = sizeof(SharedStorage<Element,
@@ -323,8 +313,7 @@ void qmm_sm75(
       &A, &dA, &sA_layout, &g2s_copy_a, &s2r_atom_a,
       &B, &dB, &sB_layout, &g2s_copy_b, &s2r_atom_b,
       &C, &dC, &sC_layout, &s2g_copy_c, &r2s_atom_c,
-      &S, &Z, &S_layout, &g2r_copy_s,
-      &mma};
+      &S, &Z, &S_layout, &mma};
   launch_kernel(
       reinterpret_cast<void*>(kernel), num_blocks, block_dims, smem_bytes, args);
 }
