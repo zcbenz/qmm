@@ -1,5 +1,6 @@
 #include <cublas_v2.h>
 #include <cute/layout.hpp>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/util/GPU_Clock.hpp>
 #include <cutlass/util/reference/device/tensor_fill.h>
 #include <cutlass/util/reference/device/tensor_compare.h>
@@ -16,6 +17,35 @@ struct SharedStorage {
   ArrayEngine<Element, cosize_v<SmemLayoutA>> A;
   ArrayEngine<Element, cosize_v<SmemLayoutB>> B;
 };
+
+template <typename Q, typename S, typename Z, typename T>
+__device__ __forceinline__ void
+dequant(const Q& w, const S& s, const Z& z, T out) {
+  // Scale must be one element.
+  CUTE_STATIC_ASSERT_V(cosize(s.layout()) == Int<1>{});
+  CUTE_STATIC_ASSERT_V(cosize(z.layout()) == Int<1>{});
+  // Quant must be contiguous.
+  auto layout = coalesce(w.layout());
+  CUTE_STATIC_ASSERT_V(stride(layout) == Int<1>{});
+#if 0
+  using Element = typename T::value_type;
+  using Quant = typename Q::value_type;
+  transform(w, out, [] (Quant q) { return Element(q); } );
+  transform(out, s, out, multiplies{});
+  transform(out, z, out, plus{});
+#else
+  // Use cutlass for conversions.
+  constexpr int N = size(layout);
+  using Element = typename T::value_type;
+  using Quant = typename Q::value_type;
+  auto& w_vec = *(reinterpret_cast<const cutlass::Array<Quant, N>*>(raw_pointer_cast(w.data())));
+  Element scale = s[0];
+  Element zero_point = z[0];
+  cutlass::NumericArrayConverter<Element, Quant, N> converter;
+  auto w_dq = converter(w_vec) * scale + zero_point;
+  copy(make_tensor(make_rmem_ptr<Element>(&w_dq), out.layout()), out);
+#endif
+}
 
 template <typename ProblemShape, typename CtaTiler,
           typename Element, typename Quant,
@@ -121,10 +151,12 @@ __global__ void qmm_naive_kernel(
   auto store_smem = [&](int tile) {
     __syncthreads();
     copy(tArA, tAsA);
-    Tensor scale = tBgS(_,_,_,tile);
-    Tensor zero_point = tBgZ(_,_,_,tile);
-    for (int i = 0; i < size(tBrB); ++i) {
-      tBrB_dq(i) = tBrB(i) * scale(i) + zero_point(i);
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tBrB); ++k) {
+      CUTE_UNROLL
+      for (int n = 0; n < size<1>(tBrB); ++n) {
+        dequant(tBrB(_,n,k), tBgS(_,n,k,tile), tBgZ(_,n,k,tile), tBrB_dq(_,n,k));
+      }
     }
     copy(tBrB_dq, tBsB);
     __syncthreads();
@@ -319,7 +351,7 @@ int main(int argc, char** argv) {
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
   using Element = cutlass::half_t;
-  using Quant = int8_t;
+  using Quant = cutlass::uint4b_t;
 
   constexpr int group_size = 64;
   constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;

@@ -1,5 +1,6 @@
 #include <cublas_v2.h>
 #include <cute/layout.hpp>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/util/GPU_Clock.hpp>
 #include <cutlass/util/reference/device/tensor_fill.h>
 #include <cutlass/util/reference/device/tensor_compare.h>
@@ -25,6 +26,35 @@ union SharedStorage {
     ArrayEngine<Element, cosize_v<SmemLayoutC>> C;
   } epilogue;
 };
+
+template <typename Q, typename S, typename Z, typename T>
+__device__ __forceinline__ void
+dequant(const Q& w, const S& s, const Z& z, T out) {
+  // Scale must be one element.
+  CUTE_STATIC_ASSERT_V(cosize(s.layout()) == Int<1>{});
+  CUTE_STATIC_ASSERT_V(cosize(z.layout()) == Int<1>{});
+  // Quant must be contiguous.
+  auto layout = coalesce(w.layout());
+  CUTE_STATIC_ASSERT_V(stride(layout) == Int<1>{});
+#if 1
+  using Element = typename T::value_type;
+  using Quant = typename Q::value_type;
+  transform(w, out, [] (Quant q) { return Element(q); } );
+  transform(out, s, out, multiplies{});
+  transform(out, z, out, plus{});
+#else
+  // Use cutlass for conversions.
+  constexpr int N = size(layout);
+  using Element = typename T::value_type;
+  using Quant = typename Q::value_type;
+  auto& w_vec = *(reinterpret_cast<const cutlass::Array<Quant, N>*>(raw_pointer_cast(w.data())));
+  Element scale = s[0];
+  Element zero_point = z[0];
+  cutlass::NumericArrayConverter<Element, Quant, N> converter;
+  auto w_dq = converter(w_vec) * scale + zero_point;
+  copy(make_tensor(make_rmem_ptr<Element>(&w_dq), out.layout()), out);
+#endif
+}
 
 template <typename ProblemShape, typename CtaTiler,
           typename Element, typename Quant,
@@ -166,13 +196,9 @@ __global__ void qmm_sm80_kernel(
   auto fetch_smem = [&](auto block) {
     copy(s2r_atom_a, s2r_tCsA(_,_,block,smem_pipe_read), s2r_tCrA(_,_,block));
     copy(s2r_atom_b, s2r_tCsB(_,_,block,smem_pipe_read), s2r_tCrB(_,_,block));
-    Tensor scale = tCrS(_,_,block);
-    Tensor zero_point = tCrZ(_,_,block);
-    Tensor quant = tCrB(_,_,block);
-    Tensor weight = tCrB_dq(_,_,block);
     CUTE_UNROLL
-    for (int i = 0; i < size(quant); ++i) {
-      weight(i) = quant(i) * scale(i) + zero_point(i);
+    for (int n = 0; n < size<1>(tCrB); ++n) {
+      dequant(tCrB(_,n,block), tCrS(_,n,block), tCrZ(_,n,block), tCrB_dq(_,n,block));
     }
   };
 
@@ -210,7 +236,7 @@ __global__ void qmm_sm80_kernel(
         fetch_scales((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
       }
       // Prefetch next block.
-      fetch_smem((block + Int<1>{}) % K_BLOCK_MAX);
+      fetch_smem((block + 1) % K_BLOCK_MAX);
       // Prefetch next tile.
       if (block == 0) {
         fetch_gmem(tile_pipe);
@@ -231,16 +257,12 @@ __global__ void qmm_sm80_kernel(
   copy_if(s2g_copy_c, tCpC, s2g_tCsC, s2g_tCgC);
 }
 
-template <typename Element, int bits, template <typename T> typename Atom,
-          typename NumThreads, typename BlockSize>
-inline auto make_tiled_copy(NumThreads num_threads, BlockSize block_size) {
-  constexpr auto elems_per_copy = Int<bits / sizeof_bits_v<Element>>{};
-  constexpr auto thrs_per_block = Int<block_size / elems_per_copy>{};
-  constexpr auto rest_threads = Int<num_threads / thrs_per_block>{};
+template <typename T, int bits, template <typename U> typename Atom, typename NumThreads>
+inline auto make_tiled_copy(NumThreads num_threads) {
   return make_tiled_copy(
-      Copy_Atom<Atom<uint_bit_t<bits>>, Element>{},
-      make_layout(make_shape(rest_threads, thrs_per_block), LayoutRight{}),
-      make_layout(make_shape(Int<1>{}, elems_per_copy)));
+      Copy_Atom<Atom<uint_bit_t<bits>>, T>{},
+      make_layout(make_shape(Int<num_threads / 8>{}, Int<8>{}), LayoutRight{}),
+      make_layout(make_shape(Int<1>{}, Int<bits / sizeof_bits_v<T>>{})));
 }
 
 template <typename Element, typename Quant, typename GroupSize, typename F>
@@ -264,16 +286,13 @@ void qmm_sm80(
   // Define CTA tile sizes (static).
   auto bM = Int<16>{};
   auto bN = Int<128>{};
-  auto bK = Int<64>{};
+  auto bK = Int<max(64, group_size)>{};
   auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
 
   // Define MMA.
-  auto pM = Int<16>{};
-  auto pN = Int<32>{};
-  auto pK = Int<16>{};
   TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
-                                Layout<Shape<_1,_2,_1>>{},
-                                make_tile(pM, pN, pK));
+                                Layout<Shape<_1,_4,_1>>{},
+                                Tile<_16,_32,_16>{});
   auto num_threads = size(mma);
 
   // Define the A/B smem layouts (static).
@@ -285,7 +304,8 @@ void qmm_sm80(
   auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN, bK, bP));
 
   // Define the C smem layouts (static).
-  auto sC_layout = make_layout(make_shape(bM, bN), LayoutRight{});
+  // TODO: Find a better swizzle.
+  auto sC_layout = tile_to_shape(swizzle_ab, make_shape(bM, bN));
 
   // Define the scales/biases smem layouts (static).
   auto bS = ceil_div(bK, group_size);
@@ -298,14 +318,16 @@ void qmm_sm80(
       make_stride(k / group_size, Stride<_0, _1>{}, n * k / group_size));
 
   // Atoms.
-  constexpr int quant_load_bits = 128 / (sizeof_bits_v<Element> / sizeof_bits_v<Quant>);
-  TiledCopy g2s_copy_a = make_tiled_copy<Element, 128, SM80_CP_ASYNC_CACHEALWAYS>(num_threads, bK);
-  TiledCopy g2s_copy_b = make_tiled_copy<Quant, quant_load_bits, SM80_CP_ASYNC_CACHEALWAYS>(num_threads, bK);
-  TiledCopy s2g_copy_c = make_tiled_copy<Element, 128, UniversalCopy>(num_threads, bN);
+  constexpr int element_bits = sizeof_bits_v<Element>;
+  constexpr int quant_bits = sizeof_bits_v<Quant>;
+  constexpr int qload = 128 / (element_bits / quant_bits);
+  TiledCopy g2s_copy_a = make_tiled_copy<Element, 128, SM80_CP_ASYNC_CACHEALWAYS>(num_threads);
+  TiledCopy g2s_copy_b = make_tiled_copy<Quant, qload, SM80_CP_ASYNC_CACHEALWAYS>(num_threads);
+  TiledCopy s2g_copy_c = make_tiled_copy<Element, 128, UniversalCopy>(num_threads);
 
   Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
-  Copy_Atom<UniversalCopy<uint_bit_t<2 * sizeof_bits_v<Quant>>>, Quant> s2r_atom_b;
-  Copy_Atom<UniversalCopy<uint_bit_t<2 * sizeof_bits_v<Element>>>, Element> r2s_atom_c;
+  Copy_Atom<UniversalCopy<uint_bit_t<2 * quant_bits>>, Quant> s2r_atom_b;
+  Copy_Atom<UniversalCopy<uint_bit_t<2 * element_bits>>, Element> r2s_atom_c;
   Copy_Atom<UniversalCopy<Element>, Element> g2r_atom_s;
 
   auto* kernel = &qmm_sm80_kernel<
@@ -423,7 +445,7 @@ int main(int argc, char** argv) {
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
   using Element = cutlass::half_t;
-  using Quant = int8_t;
+  using Quant = uint8_t;
 
   constexpr int group_size = 64;
   constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
