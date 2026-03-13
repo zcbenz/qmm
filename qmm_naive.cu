@@ -185,6 +185,33 @@ __global__ void qmm_naive_kernel(
   }
 }
 
+template <typename Element>
+inline constexpr auto make_mma_atom() {
+  if constexpr (std::is_same_v<Element, float>) {
+    return UniversalFMA<float>{};
+  }
+  if constexpr (std::is_same_v<Element, half_t>) {
+    return SM80_16x8x16_F32F16F16F32_TN{};
+  }
+  if constexpr (std::is_same_v<Element, bfloat16_t>) {
+    return SM80_16x8x16_F32BF16BF16F32_TN{};
+  }
+}
+
+template <int TileM, typename Element>
+inline constexpr auto make_tiled_mma() {
+  constexpr auto atom = make_mma_atom<Element>();
+  if constexpr (std::is_same_v<Element, float>) {
+    return make_tiled_mma(atom, Layout<Shape<_16,_8,_1>>{});
+  } else {
+    if constexpr (TileM >= 32) {
+      return make_tiled_mma(atom, Layout<Shape<_2,_2,_1>>{}, Tile<_32,_32,_16>{});
+    } else {
+      return make_tiled_mma(atom, Layout<Shape<_1,_4,_1>>{}, Tile<_16,_32,_16>{});
+    }
+  }
+}
+
 template <typename T, int bits, typename NumThreads>
 inline auto make_tiled_copy(NumThreads num_threads) {
   return make_tiled_copy(
@@ -193,7 +220,7 @@ inline auto make_tiled_copy(NumThreads num_threads) {
       make_layout(make_shape(Int<1>{}, Int<bits / sizeof_bits_v<T>>{})));
 }
 
-template <typename Element, typename Quant, typename GroupSize, typename F>
+template <int TileM = 16, typename Element, typename Quant, typename GroupSize, typename F>
 void qmm_naive(
     const Element* A,
     const Quant*   B,
@@ -218,9 +245,7 @@ void qmm_naive(
   auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
 
   // Define MMA.
-  TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{},
-                                Layout<Shape<_1,_4,_1>>{},
-                                Tile<_16,_32,_16>{});
+  TiledMMA mma = make_tiled_mma<TileM, Element>();
   auto num_threads = size(mma);
 
   // Define the A/B smem layouts (static).
@@ -350,8 +375,8 @@ int main(int argc, char** argv) {
   cudaDeviceProp device_prop;
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
-  using Element = cutlass::half_t;
-  using Quant = cutlass::uint4b_t;
+  using Element = float;
+  using Quant = uint8_t;
 
   constexpr int group_size = 64;
   constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
@@ -368,7 +393,7 @@ int main(int argc, char** argv) {
   cutlass::reference::device::BlockFillRandomUniform(
       d_A.data().get(), d_A.size(), seed, Element(0.1f), Element(-0.1f));
   cutlass::reference::device::BlockFillRandomUniform(
-      d_B.data().get(), d_B.size(), seed, Quant(0), Quant(6));
+      d_B.data().get(), d_B.size(), seed, Quant(0), Quant(16));
   cutlass::reference::device::BlockFillRandomUniform(
       d_S.data().get(), d_S.size(), seed, Element(0.1f), Element(-0.1f));
   if constexpr (has_bias) {
