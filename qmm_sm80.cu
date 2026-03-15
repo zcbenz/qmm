@@ -36,7 +36,7 @@ dequant(const Q& w, const S& s, const Z& z, T out) {
   // Quant must be contiguous.
   auto layout = coalesce(w.layout());
   CUTE_STATIC_ASSERT_V(stride(layout) == Int<1>{});
-#if 1
+#if 0
   using Element = typename T::value_type;
   using Quant = typename Q::value_type;
   transform(w, out, [] (Quant q) { return Element(q); } );
@@ -103,8 +103,6 @@ __global__ void qmm_sm80_kernel(
   Tensor gS = local_tile(mS, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
   Tensor gZ = local_tile(mZ, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
 
-  auto m_max_coord = size<0>(shape_MNKL) - size<0>(gA) * m_coord; // M - BLK_M * m_coord
-
   // Shared memory buffers.
   extern __shared__ char shared_memory[];
   using SharedStorage = SharedStorage<Element, Quant,
@@ -168,9 +166,17 @@ __global__ void qmm_sm80_kernel(
   Tensor g2r_tCrZ = g2r_thr_copy_s.retile_D(tCrZ);  // (BCPY,MMA_N,MMA_K)
 
   // Predicates for m bound.
+  auto m_max_coord = size<0>(shape_MNKL) - size<0>(gA) * m_coord; // M - BLK_M * m_coord
+  Tensor tApA = make_tensor<bool>(make_shape(size<1>(tAsA), size<2>(tAsA)), Stride<_1,_0>{});         // (CPY_M,CPY_K)
   Tensor tCpC = make_tensor<bool>(make_shape(size<1>(s2g_tCsC), size<2>(s2g_tCsC)), Stride<_1,_0>{}); // (CPY_M,CPY_N)
+  Tensor cA = make_identity_tensor(make_shape(size<0>(sA), size<1>(sA))); // (BLK_M,BLK_K)
   Tensor cC = make_identity_tensor(make_shape(size<0>(sC), size<1>(sC))); // (BLK_M,BLK_N)
+  Tensor tAcA = g2s_thr_copy_a.partition_D(cA); // (CPY,CPY_M,CPY_K)
   Tensor tCcC = s2g_thr_copy_c.partition_D(cC); // (CPY,CPY_M,CPY_N)
+  CUTE_UNROLL
+  for (int m = 0; m < size<0>(tApA); ++m) {
+    tApA(m,0) = get<0>(tAcA(0,m,0)) < m_max_coord;
+  }
   CUTE_UNROLL
   for (int m = 0; m < size<0>(tCpC); ++m) {
     tCpC(m,0) = get<0>(tCcC(0,m,0)) < m_max_coord;
@@ -182,7 +188,7 @@ __global__ void qmm_sm80_kernel(
 
   // Copy A/B: GMEM => SMEM.
   auto fetch_gmem = [&](int tile) {
-    copy(g2s_copy_a, tAgA(_,_,_,tile), tAsA(_,_,_,smem_pipe_write));
+    copy_if(g2s_copy_a, tApA, tAgA(_,_,_,tile), tAsA(_,_,_,smem_pipe_write));
     copy(g2s_copy_b, tBgB(_,_,_,tile), tBsB(_,_,_,smem_pipe_write));
     cp_async_fence();
     smem_pipe_write = (smem_pipe_write + 1) % K_PIPE_MAX;
@@ -259,9 +265,6 @@ __global__ void qmm_sm80_kernel(
 
 template <typename Element>
 inline constexpr auto make_mma_atom() {
-  if constexpr (std::is_same_v<Element, float>) {
-    return UniversalFMA<float>{};
-  }
   if constexpr (std::is_same_v<Element, half_t>) {
     return SM80_16x8x16_F32F16F16F32_TN{};
   }
@@ -469,6 +472,7 @@ int main(int argc, char** argv) {
   using Quant = uint8_t;
 
   constexpr int group_size = 64;
+  constexpr int tile_m = 16;
   constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
 
   thrust::device_vector<Element> d_A(m*k*l);
@@ -517,7 +521,7 @@ int main(int argc, char** argv) {
       stream);
 
   // Run once
-  cute_gemm::qmm_sm80(
+  cute_gemm::qmm_sm80<tile_m>(
       d_A.data().get(),
       d_B.data().get(),
       d_S.data().get(),
@@ -572,7 +576,7 @@ int main(int argc, char** argv) {
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cute_gemm::qmm_sm80(
+    cute_gemm::qmm_sm80<tile_m>(
         d_A.data().get(),
         d_B.data().get(),
         d_S.data().get(),
