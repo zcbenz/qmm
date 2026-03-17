@@ -69,9 +69,9 @@ __global__ void qmm_naive_kernel(
   auto [m_coord, n_coord, l_coord] = static_cast<uint3>(blockIdx);
 
   // Represent the full tensors.
-  Tensor mA_mkl = make_tensor(make_gmem_ptr(A), select<0,2,3>(shape_MNKL), dA); // (M,K,L)
-  Tensor mB_nkl = make_tensor(make_gmem_ptr(B), select<1,2,3>(shape_MNKL), dB); // (N,K,L)
-  Tensor mC_mnl = make_tensor(make_gmem_ptr(C), select<0,1,3>(shape_MNKL), dC); // (M,N,L)
+  Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        select<0,2,3>(shape_MNKL), dA); // (M,K,L)
+  Tensor mB_nkl = make_tensor(make_gmem_ptr<Quant>(B), select<1,2,3>(shape_MNKL), dB); // (N,K,L)
+  Tensor mC_mnl = make_tensor(make_gmem_ptr(C),        select<0,1,3>(shape_MNKL), dC); // (M,N,L)
 
   Tensor mS_nkl = make_tensor(make_gmem_ptr(S), S_layout); // (N,(group_size,K/group_size),L)
   Tensor mZ_nkl = make_tensor(make_gmem_ptr(Z), S_layout); // (N,(group_size,K/group_size),L)
@@ -375,8 +375,8 @@ int main(int argc, char** argv) {
   cudaDeviceProp device_prop;
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
-  using Element = float;
-  using Quant = uint8_t;
+  using Element = cutlass::half_t;
+  using Quant = cutlass::uint4b_t;
 
   constexpr int group_size = 64;
   constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
@@ -393,7 +393,7 @@ int main(int argc, char** argv) {
   cutlass::reference::device::BlockFillRandomUniform(
       d_A.data().get(), d_A.size(), seed, Element(0.1f), Element(-0.1f));
   cutlass::reference::device::BlockFillRandomUniform(
-      d_B.data().get(), d_B.size(), seed, Quant(0), Quant(16));
+      d_B.data().get(), d_B.size(), seed, Quant(0), Quant(6));
   cutlass::reference::device::BlockFillRandomUniform(
       d_S.data().get(), d_S.size(), seed, Element(0.1f), Element(-0.1f));
   if constexpr (has_bias) {

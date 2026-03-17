@@ -39,6 +39,10 @@ build/fp8_bug: fp8_bug.cu
 	mkdir -p build
 	nvcc $< $(FLAGS) -o $@
 
+build/subbyte_bug: subbyte_bug.cu
+	mkdir -p build
+	nvcc $< $(FLAGS) -o $@
+
 .PHONY: clean
 clean:
 	rm -r build
