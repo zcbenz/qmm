@@ -12,6 +12,9 @@ namespace cute_gemm {
 
 using namespace cute;
 
+template <typename Quant>
+constexpr bool has_bias_v = !cutlass::has_negative_zero_v<Quant>;
+
 template <typename Element,
           typename Quant,
           typename SmemLayoutA,
@@ -36,28 +39,23 @@ dequant(const Q& w, const S& s, const Z& z, T out) {
   // Quant must be contiguous.
   auto layout = coalesce(w.layout());
   CUTE_STATIC_ASSERT_V(stride(layout) == Int<1>{});
-#if 0
-  using Element = typename T::value_type;
-  using Quant = typename Q::value_type;
-  transform(w, out, [] (Quant q) { return Element(q); } );
-  transform(out, s, out, multiplies{});
-  transform(out, z, out, plus{});
-#else
   // Use cutlass for conversions.
   constexpr int N = size(layout);
   using Element = typename T::value_type;
   using Quant = typename Q::value_type;
   auto& w_vec = *(reinterpret_cast<const cutlass::Array<Quant, N>*>(raw_pointer_cast(w.data())));
-  Element scale = s[0];
-  Element zero_point = z[0];
+  Element scale{s[0]};
   cutlass::NumericArrayConverter<Element, Quant, N> converter;
-  auto w_dq = converter(w_vec) * scale + zero_point;
+  auto w_dq = converter(w_vec) * scale;
+  if constexpr (has_bias_v<Quant>) {
+    Element zero_point{z[0]};
+    w_dq = w_dq + zero_point;
+  }
   copy(make_tensor(make_rmem_ptr<Element>(&w_dq), out.layout()), out);
-#endif
 }
 
 template <typename ProblemShape, typename CtaTiler,
-          typename Element, typename Quant,
+          typename Element, typename Quant, typename Scale,
           typename StrideA, typename SmemLayoutA, typename TiledCopyA, typename S2RAtomA,
           typename StrideB, typename SmemLayoutB, typename TiledCopyB, typename S2RAtomB,
           typename StrideC, typename SmemLayoutC, typename TiledCopyC, typename R2SAtomC,
@@ -67,7 +65,7 @@ __global__ void qmm_sm80_kernel(
     const Element* A, StrideA dA, SmemLayoutA sA_layout, TiledCopyA g2s_copy_a, S2RAtomA s2r_atom_a,
     const Quant*   B, StrideB dB, SmemLayoutB sB_layout, TiledCopyB g2s_copy_b, S2RAtomB s2r_atom_b,
           Element* C, StrideC dC, SmemLayoutC sC_layout, TiledCopyC s2g_copy_c, R2SAtomC r2s_atom_c,
-    const Element* S, const Element* Z, LayoutS S_layout, G2RAtomS g2r_atom_s, TiledMma mma) {
+    const Scale* S, const Element* Z, LayoutS S_layout, G2RAtomS g2r_atom_s, TiledMma mma) {
   CUTE_STATIC_ASSERT_V(size(g2s_copy_a) == size(mma));
   CUTE_STATIC_ASSERT_V(size(g2s_copy_b) == size(mma));
   CUTE_STATIC_ASSERT_V(size(s2g_copy_c) == size(mma));
@@ -196,7 +194,9 @@ __global__ void qmm_sm80_kernel(
   // Copy S/Z: GMEM => RMEM.
   auto fetch_scales = [&](int tile) {
     copy(g2r_copy_s, g2r_tCgS(_,_,_,tile), g2r_tCrS);
-    copy(g2r_copy_s, g2r_tCgZ(_,_,_,tile), g2r_tCrZ);
+    if constexpr (has_bias_v<Quant>) {
+      copy(g2r_copy_s, g2r_tCgZ(_,_,_,tile), g2r_tCrZ);
+    }
   };
   // Copy A/B: SMEM => RMEM.
   auto fetch_smem = [&](auto block) {
@@ -291,11 +291,11 @@ inline auto make_tiled_copy(NumThreads num_threads) {
       make_layout(make_shape(Int<1>{}, Int<bits / sizeof_bits_v<T>>{})));
 }
 
-template <int TileM = 16, typename Element, typename Quant, typename GroupSize, typename F>
+template <int TileM = 16, typename Element, typename Quant, typename Scale, typename GroupSize, typename F>
 void qmm_sm80(
     const Element* A,
     const Quant*   B,
-    const Element* S,
+    const Scale* S,
     const Element* Z,
     Element* C,
     int m, int n, int k, int l,
@@ -352,11 +352,11 @@ void qmm_sm80(
   Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
   Copy_Atom<UniversalCopy<uint_bit_t<2 * quant_bits>>, Quant> s2r_atom_b;
   Copy_Atom<UniversalCopy<uint_bit_t<2 * element_bits>>, Element> r2s_atom_c;
-  Copy_Atom<UniversalCopy<Element>, Element> g2r_atom_s;
+  Copy_Atom<UniversalCopy<Scale>, Scale> g2r_atom_s;
 
   auto* kernel = &qmm_sm80_kernel<
       decltype(prob_shape), decltype(cta_tiler),
-      Element, Quant,
+      Element, Quant, Scale,
       decltype(dA), decltype(sA_layout), decltype(g2s_copy_a), decltype(s2r_atom_a),
       decltype(dB), decltype(sB_layout), decltype(g2s_copy_b), decltype(s2r_atom_b),
       decltype(dC), decltype(sC_layout), decltype(s2g_copy_c), decltype(r2s_atom_c),
@@ -469,16 +469,17 @@ int main(int argc, char** argv) {
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
   using Element = cutlass::half_t;
-  using Quant = cutlass::uint4b_t;
+  using Quant = uint8_t;
+  using Scale = Element;
 
   constexpr int group_size = 64;
   constexpr int tile_m = 16;
-  constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
+  constexpr bool has_bias = !cutlass::has_negative_zero_v<Quant>;
 
   thrust::device_vector<Element> d_A(m*k*l);
   thrust::device_vector<Quant>   d_B(n*k*l);    // quantized B
   thrust::device_vector<Element> d_B_dq(n*k*l); // dequantized B
-  thrust::device_vector<Element> d_S(n*k*l/group_size); // scales
+  thrust::device_vector<Scale> d_S(n*k*l/group_size); // scales
   thrust::device_vector<Element> d_Z(n*k*l/group_size); // zero points
   thrust::device_vector<Element> d_D(m*n*l);
   thrust::device_vector<Element> d_D_ref(m*n*l);
@@ -489,7 +490,7 @@ int main(int argc, char** argv) {
   cutlass::reference::device::BlockFillRandomUniform(
       d_B.data().get(), d_B.size(), seed, Quant(0), Quant(16));
   cutlass::reference::device::BlockFillRandomUniform(
-      d_S.data().get(), d_S.size(), seed, Element(0.1f), Element(-0.1f));
+      d_S.data().get(), d_S.size(), seed, Scale(0.1f), Scale(-0.1f));
   if constexpr (has_bias) {
     cutlass::reference::device::BlockFillRandomUniform(
         d_Z.data().get(), d_Z.size(), seed, Element(0.1f), Element(-0.1f));
