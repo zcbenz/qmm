@@ -51,8 +51,9 @@ __device__ __forceinline__ void
 cute_naive_dequant(auto w, auto s, auto z, auto out) {
   using Element = typename decltype(out)::value_type;
   using Quant = typename decltype(w)::value_type;
-  transform(w, out, [] (Quant q) { return Element(q); } );
-  transform(out, s, out, multiplies{});
+  using Scale = typename decltype(s)::value_type;
+  transform(w, out, [](Quant q) { return Element(q); } );
+  transform(out, s, out, [](Element e, Scale s) { return e * Element(s); });
   if constexpr (has_bias_v<Quant>) {
     transform(out, z, out, plus{});
   }
@@ -69,7 +70,7 @@ cute_dequant(auto w, auto s, auto z, auto out) {
 }
 
 template <typename ProblemShape, typename CtaTiler,
-          typename Element, typename Quant,
+          typename Element, typename Quant, typename Scale,
           typename StrideA, typename SmemLayoutA, typename TiledCopyA,
           typename StrideB, typename SmemLayoutB, typename TiledCopyB,
           typename StrideC, typename LayoutS, typename TiledMma>
@@ -78,7 +79,7 @@ __global__ void qmm_naive_kernel(
     const Element* A, StrideA dA, SmemLayoutA sA_layout, TiledCopyA copy_a,
     const Quant*   B, StrideB dB, SmemLayoutB sB_layout, TiledCopyB copy_b,
           Element* C, StrideC dC,
-    const Element* S, const Element* Z, LayoutS S_layout,
+    const Scale* S, const Element* Z, LayoutS S_layout,
     TiledMma mma) {
   CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));
   CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));
@@ -131,12 +132,14 @@ __global__ void qmm_naive_kernel(
   Tensor tArA = make_fragment_like(tAsA);   // (ACPY,ACPY_M,ACPY_K)
 
   ThrCopy thr_copy_b = copy_b.get_slice(thread_idx);
-  Tensor tBgB = thr_copy_b.partition_S(gB);      // (BCPY,BCPY_N,BCPY_K,k)
-  Tensor tBsB = thr_copy_b.partition_D(sB);      // (BCPY,BCPY_N,BCPY_K)
-  Tensor tBrB = make_fragment_like<Quant>(tBsB); // (BCPY,BCPY_M,BCPY_K)
-  Tensor tBrB_dq = make_fragment_like(tBsB);     // (BCPY,BCPY_M,BCPY_K)
-  Tensor tBgS = thr_copy_b.partition_S(gS);      // (BCPY,BCPY_N,BCPY_K,k)
-  Tensor tBgZ = thr_copy_b.partition_S(gZ);      // (BCPY,BCPY_N,BCPY_K,k)
+  Tensor tBgB = thr_copy_b.partition_S(gB);        // (BCPY,BCPY_N,BCPY_K,k)
+  Tensor tBsB = thr_copy_b.partition_D(sB);        // (BCPY,BCPY_N,BCPY_K)
+  Tensor tBrB = make_fragment_like<Quant>(tBsB);   // (BCPY,BCPY_M,BCPY_K)
+  Tensor tBrB_dq = make_fragment_like(tBsB);       // (BCPY,BCPY_M,BCPY_K)
+  Tensor tBgS = thr_copy_b.partition_S(gS);        // (BCPY,BCPY_N,BCPY_K,k)
+  Tensor tBrS = make_fragment_like(tBgS(_,_,_,0)); // (BCPY,BCPY_N,BCPY_K)
+  Tensor tBgZ = thr_copy_b.partition_S(gZ);        // (BCPY,BCPY_N,BCPY_K,k)
+  Tensor tBrZ = make_fragment_like(tBgZ(_,_,_,0)); // (BCPY,BCPY_N,BCPY_K)
 
   // MMA.
   ThrMMA thr_mma = mma.get_slice(thread_idx);
@@ -150,7 +153,7 @@ __global__ void qmm_naive_kernel(
   Tensor tBpB = make_tensor<bool>(make_shape(size<1>(tBsB), size<2>(tBsB)), Stride<_1,_0>{}); // (CPY_N,CPY_K)
   Tensor cA = make_identity_tensor(make_shape(size<0>(sA), size<1>(sA))); // (BLK_M,BLK_K)
   Tensor cB = make_identity_tensor(make_shape(size<0>(sB), size<1>(sB))); // (BLK_N,BLK_K)
-  Tensor cC = make_identity_tensor(make_shape(size<0>(gC), size<1>(gC))); // (BLK_M,BLK_N)
+  Tensor cC = make_identity_tensor(make_shape(size<0>(gC), size<1>(gC))); // (M,N)
   Tensor tAcA = thr_copy_a.partition_S(cA); // (CPY,CPY_M,CPY_K)
   Tensor tBcB = thr_copy_b.partition_S(cB); // (CPY,CPY_N,CPY_K)
   Tensor tCcC = thr_mma.partition_C(cC);    // (MMA,MMA_M,MMA_N)
@@ -167,16 +170,18 @@ __global__ void qmm_naive_kernel(
   auto fetch_gmem = [&](int tile) {
     copy_if(copy_a, tApA, tAgA(_,_,_,tile), tArA);
     copy_if(copy_b, tBpB, tBgB(_,_,_,tile), tBrB);
+    copy(tBgS(_,_,_,tile), tBrS);
+    copy(tBgZ(_,_,_,tile), tBrZ);
   };
   // RMEM => SMEM.
-  auto store_smem = [&](int tile) {
+  auto store_smem = [&]() {
     __syncthreads();
     copy(tArA, tAsA);
     CUTE_UNROLL
     for (int k = 0; k < size<2>(tBrB); ++k) {
       CUTE_UNROLL
       for (int n = 0; n < size<1>(tBrB); ++n) {
-        cute_dequant(tBrB(_,n,k), tBgS(_,n,k,tile), tBgZ(_,n,k,tile), tBrB_dq(_,n,k));
+        cute_dequant(tBrB(_,n,k), tBrS(_,n,k), tBrZ(_,n,k), tBrB_dq(_,n,k));
       }
     }
     copy(tBrB_dq, tBsB);
@@ -192,7 +197,7 @@ __global__ void qmm_naive_kernel(
   // Loop over CTA tiles.
   auto K_TILE_MAX  = size<3>(tAgA);
   for (int tile = 0; tile < K_TILE_MAX; ++tile) {
-    store_smem(tile);
+    store_smem();
     fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
     gemm(mma, tCsA, tCsB, tCrC);
   }
@@ -201,7 +206,7 @@ __global__ void qmm_naive_kernel(
   CUTE_UNROLL
   for (int i = 0; i < size(tCrC); ++i) {
     if ((get<0>(tCcC(i)) < m_max_coord) && (get<1>(tCcC(i)) < n_max_coord)) {
-      tCgC(i) = tCrC(i);
+      tCgC(i) = Element(tCrC(i));
     }
   }
 }
@@ -274,15 +279,29 @@ inline auto make_tiled_copy(auto num_threads, auto bM, auto bK) {
   }
 }
 
-template <int TileM = 16, bool SM80 = true, bool KMajor = true,
-          typename Element, typename Quant>
+template <bool KMajor>
+inline constexpr auto make_scales_layout(auto n, auto k, auto l, auto group_size) {
+  if constexpr (KMajor) {
+    return make_layout(
+        make_shape(n, make_shape(group_size, k / group_size), l),
+        make_stride(k / group_size, Stride<_0,_1>{}, n * k / group_size));
+  } else {
+    return make_layout(
+        make_shape(make_shape(group_size, n / group_size), k, l),
+        make_stride(Stride<_0,_1>{}, n / group_size, n * k / group_size));
+  }
+}
+
+template <int TileM = 16, bool KMajor = true, bool SM80 = true,
+          typename Element, typename Quant, typename Scale>
 void qmm_naive(
     const Element* A,
     const Quant*   B,
-    const Element* S,
+    const Scale*   S,
     const Element* Z,
     Element* C,
     int m, int n, int k, int l,
+    bool broadcast_b,
     auto group_size,
     auto&& launch_kernel) {
   // Define shapes (dynamic).
@@ -292,6 +311,15 @@ void qmm_naive(
   auto dA = make_stride(k, Int<1>{}, m * k);  // (dM,dK,dL)
   auto dB = make_matrix_stride<KMajor>(n, k); // (dN,dK,dL)
   auto dC = make_stride(n, Int<1>{}, m * n);  // (dM,dN,dL)
+
+  // Define layout of scales/biases (mixed).
+  auto S_layout = make_scales_layout<KMajor>(n, k, l, group_size);
+
+  // Handle broadcasting.
+  if (broadcast_b) {
+    get<2>(dB) = 0;
+    get<2>(S_layout) = 0;
+  }
 
   // Define CTA tile sizes (static).
   auto bM = Int<TileM>{};
@@ -307,18 +335,13 @@ void qmm_naive(
   auto sA_layout = make_smem_layout(bM, bK);
   auto sB_layout = make_smem_layout<KMajor>(bN, bK);
 
-  // Define layout of scales/biases (mixed).
-  auto S_layout = make_layout(
-      make_shape(n, make_shape(group_size, k / group_size), l),
-      make_stride(k / group_size, Stride<_0,_1>{}, n * k / group_size));
-
   // Atoms.
   TiledCopy copy_a = make_tiled_copy<Element>(num_threads, bM, bK);
   TiledCopy copy_b = make_tiled_copy<Quant, KMajor>(num_threads, bN, bK);
 
   auto* kernel = &qmm_naive_kernel<
       decltype(prob_shape), decltype(cta_tiler),
-      Element, Quant,
+      Element, Quant, Scale,
       decltype(dA), decltype(sA_layout), decltype(copy_a),
       decltype(dB), decltype(sB_layout), decltype(copy_b),
       decltype(dC), decltype(S_layout), decltype(mma)>;
@@ -443,10 +466,8 @@ int main(int argc, char** argv) {
   using Quant = cutlass::uint4b_t;
   constexpr int TileM = 16;
   constexpr bool SM80 = true;
-  constexpr bool KMajor = true;
-
+  constexpr bool KMajor = false;
   constexpr int group_size = 64;
-  constexpr bool has_bias = cute::sizeof_bits_v<Quant> > 8 || !cutlass::has_negative_zero_v<Quant>;
 
   thrust::device_vector<Element> d_A(m*k*l);
   thrust::device_vector<Quant>   d_B(n*k*l);    // quantized B
@@ -463,7 +484,7 @@ int main(int argc, char** argv) {
       d_B.data().get(), d_B.size(), seed, Quant(0), Quant(6));
   cutlass::reference::device::BlockFillRandomUniform(
       d_S.data().get(), d_S.size(), seed, Element(0.1f), Element(-0.1f));
-  if constexpr (has_bias) {
+  if constexpr (cute_gemm::has_bias_v<Quant>) {
     cutlass::reference::device::BlockFillRandomUniform(
         d_Z.data().get(), d_Z.size(), seed, Element(0.1f), Element(-0.1f));
   } else {
@@ -483,24 +504,39 @@ int main(int argc, char** argv) {
 
   using namespace cute;
   cudaStream_t stream = nullptr;
+  auto make_weight_layout = [&]<bool KMajor>() {
+    if constexpr (KMajor) {
+      return make_layout(make_shape(n, k, l), make_stride(k, Int<1>{}, n * k));
+    } else {
+      return make_layout(make_shape(k, n, l), make_stride(n, Int<1>{}, n * k));
+    }
+  };
+  auto make_scales_layout = [&]<bool KMajor>() {
+    if constexpr (KMajor) {
+      return make_layout(make_shape(n, k / group_size, l), make_stride(k / group_size, Int<1>{}, n * k / group_size));
+    } else {
+      return make_layout(make_shape(k, n / group_size, l), make_stride(n / group_size, Int<1>{}, n * k / group_size));
+    }
+  };
   cutlass::dequantize(
       d_B_dq.data().get(),
       d_B.data().get(),
-      make_layout(make_shape(n, k, l), cute_gemm::make_matrix_stride<KMajor>(n, k)),
+      make_weight_layout.operator()<KMajor>(),
       d_S.data().get(),
       d_Z.data().get(),
-      make_layout(make_shape(n, k / group_size, l), make_stride(k / group_size, Int<1>{}, n * k / group_size)),
+      make_scales_layout.operator()<KMajor>(),
       group_size,
       stream);
 
   // Run once
-  cute_gemm::qmm_naive<TileM, SM80, KMajor>(
+  cute_gemm::qmm_naive<TileM, KMajor, SM80>(
       d_A.data().get(),
       d_B.data().get(),
       d_S.data().get(),
       d_Z.data().get(),
       d_D.data().get(),
       m, n, k, l,
+      false,
       Int<group_size>{},
       launch_kernel);
   CUTE_CHECK_LAST();
@@ -548,13 +584,14 @@ int main(int argc, char** argv) {
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cute_gemm::qmm_naive<TileM, SM80, KMajor>(
+    cute_gemm::qmm_naive<TileM, KMajor, SM80>(
         d_A.data().get(),
         d_B.data().get(),
         d_S.data().get(),
         d_Z.data().get(),
         d_D.data().get(),
         m, n, k, l,
+        false,
         Int<group_size>{},
         launch_kernel);
   }
