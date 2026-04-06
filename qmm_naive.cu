@@ -11,6 +11,133 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
+namespace cutlass {
+
+using uint3b_t = integer_subbyte<3, false>;
+using uint5b_t = integer_subbyte<5, false>;
+
+template <typename T, int N, FloatRoundStyle Round>
+struct NumericArrayConverter<T, uint3b_t, N, Round> {
+  static_assert(N % 8 == 0);
+
+  using result_type = Array<T, N>;
+  using source_type = Array<uint3b_t, N>;
+
+  CUTLASS_HOST_DEVICE
+  static result_type convert(const source_type& source) {
+    result_type result;
+    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N / 8; ++i) {
+      auto* s = s_base + i * 3;
+      result[i * 8] = T(s[0] & 0x07);
+      result[i * 8 + 1] = T((s[0] & 0x38) >> 3);
+      result[i * 8 + 2] = T((s[0] & 0xc0) >> 6) + T((s[1] & 0x01) << 2);
+      result[i * 8 + 3] = T((s[1] & 0x0e) >> 1);
+      result[i * 8 + 4] = T((s[1] & 0x70) >> 4);
+      result[i * 8 + 5] = T((s[1] & 0x80) >> 7) + T((s[2] & 0x03) << 1);
+      result[i * 8 + 6] = T((s[2] & 0x1c) >> 2);
+      result[i * 8 + 7] = T((s[2] & 0xe0) >> 5);
+    }
+    return result;
+  }
+
+  CUTLASS_HOST_DEVICE
+  result_type operator()(const source_type& s) const {
+    return convert(s);
+  }
+};
+
+template <typename T, int N, FloatRoundStyle Round>
+struct NumericArrayConverter<T, uint5b_t, N, Round> {
+  static_assert(N % 8 == 0);
+
+  using result_type = Array<T, N>;
+  using source_type = Array<uint5b_t, N>;
+
+  CUTLASS_HOST_DEVICE
+  static result_type convert(const source_type& source) {
+    result_type result;
+    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N / 8; ++i) {
+      auto* s = s_base + i * 5;
+      result[i * 8] = T(s[0] & 0x1f);
+      result[i * 8 + 1] = T((s[0] & 0xe0) >> 5) + T((s[1] & 0x03) << 3);
+      result[i * 8 + 2] = T((s[1] & 0x7c) >> 2);
+      result[i * 8 + 3] = T((s[1] & 0x80) >> 7) + T((s[2] & 0x0f) << 1);
+      result[i * 8 + 4] = T((s[2] & 0xf0) >> 4) + T((s[3] & 0x01) << 4);
+      result[i * 8 + 5] = T((s[3] & 0x3e) >> 1);
+      result[i * 8 + 6] = T((s[3] & 0xc0) >> 6) + T((s[4] & 0x07) << 2);
+      result[i * 8 + 7] = T((s[4] & 0xf8) >> 3);
+    }
+    return result;
+  }
+
+  CUTLASS_HOST_DEVICE
+  result_type operator()(const source_type& s) const {
+    return convert(s);
+  }
+};
+
+template <typename T, int N, FloatRoundStyle Round>
+struct NumericArrayConverter<T, uint6b_t, N, Round> {
+  static_assert(N % 4 == 0);
+
+  using result_type = Array<T, N>;
+  using source_type = Array<uint6b_t, N>;
+
+  CUTLASS_HOST_DEVICE
+  static result_type convert(const source_type& source) {
+    result_type result;
+    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N / 4; ++i) {
+      auto* s = s_base + i * 3;
+      result[i * 4] = T(s[0] & 0x3f);
+      result[i * 4 + 1] = T((s[0] >> 6) & 0x03) + T((s[1] & 0x0f) << 2);
+      result[i * 4 + 2] = T((s[1] >> 4) & 0x0f) + T((s[2] & 0x03) << 4);
+      result[i * 4 + 3] = T((s[2] >> 2) & 0x3f);
+    }
+    return result;
+  }
+
+  CUTLASS_HOST_DEVICE
+  result_type operator()(const source_type& s) const {
+    return convert(s);
+  }
+};
+
+} // namespace cutlass
+
+namespace cute {
+
+// Required by tiled copy for 3/5/6-bit weights.
+struct uint24_t {
+  std::array<std::uint8_t, 3> bytes;
+};
+struct uint40_t {
+  std::array<std::uint8_t, 5> bytes;
+};
+struct uint48_t {
+  std::array<std::uint8_t, 6> bytes;
+};
+
+template <>
+struct uint_bit<24> {
+  using type = uint24_t;
+};
+template <>
+struct uint_bit<40> {
+  using type = uint40_t;
+};
+template <>
+struct uint_bit<48> {
+  using type = uint48_t;
+};
+
+} // namespace cute
+
 namespace cute_gemm {
 
 using namespace cute;
@@ -69,7 +196,7 @@ cute_dequant(auto w, auto s, auto z, auto out) {
   }
 }
 
-template <typename ProblemShape, typename CtaTiler,
+template <bool HasKResidue, typename ProblemShape, typename CtaTiler,
           typename Element, typename Quant, typename Scale,
           typename StrideA, typename SmemLayoutA, typename TiledCopyA,
           typename StrideB, typename SmemLayoutB, typename TiledCopyB,
@@ -89,6 +216,20 @@ __global__ void qmm_naive_kernel(
 
   int thread_idx = int(threadIdx.x);
   auto [m_coord, n_coord, l_coord] = static_cast<uint3>(blockIdx);
+
+  auto m_max_coord = size<0>(shape_MNKL) - size<0>(cta_tiler) * m_coord; // M - BLK_M * m_coord
+  auto n_max_coord = size<1>(shape_MNKL) - size<1>(cta_tiler) * n_coord; // N - BLK_N * n_coord
+
+  // Shift tensor so we handle residue of K in the 0th tile.
+  auto shape_K = size<2>(shape_MNKL);
+  auto bK = size<2>(cta_tiler);
+  auto k_residue = shape_K - bK * ceil_div(shape_K, bK);
+  if constexpr (HasKResidue) {
+    A += k_residue * get<1>(dA);
+    B += k_residue * get<1>(dB) * cuda::std::min(8, sizeof_bits_v<Quant>) / 8;
+    S += k_residue * stride<1>(S_layout);
+    Z += k_residue * stride<1>(S_layout);
+  }
 
   // Represent the full tensors.
   Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        select<0,2,3>(shape_MNKL), dA); // (M,K,L)
@@ -114,9 +255,6 @@ __global__ void qmm_naive_kernel(
 
   Tensor gS = local_tile(mS, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
   Tensor gZ = local_tile(mZ, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
-
-  auto m_max_coord = size<0>(shape_MNKL) - size<0>(gA) * m_coord; // M - BLK_M * m_coord
-  auto n_max_coord = size<1>(shape_MNKL) - size<0>(gB) * n_coord; // N - BLK_N * n_coord
 
   // Shared memory buffers.
   extern __shared__ char shared_memory[];
@@ -188,17 +326,53 @@ __global__ void qmm_naive_kernel(
     __syncthreads();
   };
 
+  // Clear the rmem tiles to account for predicated off loads.
+  if constexpr (HasKResidue) {
+    clear(tArA);
+    clear(tBrB);
+    clear(tBrS);
+    clear(tBrZ);
+  }
+
   // Prefetch first tile.
-  fetch_gmem(0);
+  if constexpr (HasKResidue) {
+    Tensor tAgA_k = tAgA(_,_,_,0);
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tArA); ++k) {
+      if (get<1>(tAcA(0,0,k)) >= -k_residue) {
+        copy_if(copy_a, tApA(_,k), tAgA_k(_,_,k), tArA(_,_,k));
+      }
+    }
+    Tensor tBgB_k = tBgB(_,_,_,0);
+    Tensor tBgS_k = tBgS(_,_,_,0);
+    Tensor tBgZ_k = tBgZ(_,_,_,0);
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tBrB); ++k) {
+      if (get<1>(tBcB(0,0,k)) >= -k_residue) {
+        copy_if(copy_b, tBpB(_,k), tBgB_k(_,_,k), tBrB(_,_,k));
+        copy(tBgS_k(_,_,k), tBrS(_,_,k));
+        copy(tBgZ_k(_,_,k), tBrZ(_,_,k));
+      }
+    }
+  } else {
+    fetch_gmem(0);
+  }
 
   // Clear accumulators.
   clear(tCrC);
 
   // Loop over CTA tiles.
-  auto K_TILE_MAX  = size<3>(tAgA);
+  auto K_TILE_MAX = size<3>(tAgA);
   for (int tile = 0; tile < K_TILE_MAX; ++tile) {
     store_smem();
-    fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
+    if constexpr (HasKResidue) {
+      // Avoid fetching full 0th-tile when there is residue.
+      if (K_TILE_MAX > 1) {
+        fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
+      }
+    } else {
+      fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
+    }
     gemm(mma, tCsA, tCsB, tCrC);
   }
 
@@ -260,9 +434,10 @@ inline constexpr auto make_tiled_mma() {
   }
 }
 
-template <typename T, bool KMajor = true>
+template <typename T, bool KMajor = true, bool HasKResidue = false>
 inline auto make_tiled_copy(auto num_threads, auto bM, auto bK) {
-  auto n_read = Int<8>{};
+  // TODO: Only do 1-element read for the tile of residue.
+  auto n_read = Int<HasKResidue ? 1 : 8>{};
   auto atom = Copy_Atom<UniversalCopy<uint_bit_t<n_read * sizeof_bits_v<T>>>, T>{};
   if constexpr (KMajor) {
     auto k_threads = bK / n_read;
@@ -292,7 +467,7 @@ inline constexpr auto make_scales_layout(auto n, auto k, auto l, auto group_size
   }
 }
 
-template <int TileM = 16, bool KMajor = true, bool SM80 = true,
+template <int TileM = 16, bool KMajor = true, bool SM80 = true, bool HasKResidue = false,
           typename Element, typename Quant, typename Scale>
 void qmm_naive(
     const Element* A,
@@ -318,12 +493,12 @@ void qmm_naive(
   // Handle broadcasting.
   if (broadcast_b) {
     get<2>(dB) = 0;
-    get<2>(S_layout) = 0;
+    get<2>(stride(S_layout)) = 0;
   }
 
   // Define CTA tile sizes (static).
   auto bM = Int<TileM>{};
-  auto bN = Int<128>{};
+  auto bN = Int<(!SM80 && group_size > 64) ? 64 : 128>{};
   auto bK = Int<max(64, group_size)>{};
   auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
 
@@ -336,11 +511,11 @@ void qmm_naive(
   auto sB_layout = make_smem_layout<KMajor>(bN, bK);
 
   // Atoms.
-  TiledCopy copy_a = make_tiled_copy<Element>(num_threads, bM, bK);
+  TiledCopy copy_a = make_tiled_copy<Element, true, HasKResidue>(num_threads, bM, bK);
   TiledCopy copy_b = make_tiled_copy<Quant, KMajor>(num_threads, bN, bK);
 
   auto* kernel = &qmm_naive_kernel<
-      decltype(prob_shape), decltype(cta_tiler),
+      HasKResidue, decltype(prob_shape), decltype(cta_tiler),
       Element, Quant, Scale,
       decltype(dA), decltype(sA_layout), decltype(copy_a),
       decltype(dB), decltype(sB_layout), decltype(copy_b),
@@ -463,10 +638,11 @@ int main(int argc, char** argv) {
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
   using Element = cutlass::half_t;
-  using Quant = cutlass::uint4b_t;
+  using Quant = cutlass::uint2b_t;
   constexpr int TileM = 16;
   constexpr bool SM80 = true;
   constexpr bool KMajor = false;
+  constexpr bool HasKResidue = true;
   constexpr int group_size = 64;
 
   thrust::device_vector<Element> d_A(m*k*l);
@@ -529,7 +705,7 @@ int main(int argc, char** argv) {
       stream);
 
   // Run once
-  cute_gemm::qmm_naive<TileM, KMajor, SM80>(
+  cute_gemm::qmm_naive<TileM, KMajor, SM80, HasKResidue>(
       d_A.data().get(),
       d_B.data().get(),
       d_S.data().get(),
@@ -584,7 +760,7 @@ int main(int argc, char** argv) {
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cute_gemm::qmm_naive<TileM, KMajor, SM80>(
+    cute_gemm::qmm_naive<TileM, KMajor, SM80, HasKResidue>(
         d_A.data().get(),
         d_B.data().get(),
         d_S.data().get(),
