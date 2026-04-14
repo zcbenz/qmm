@@ -35,6 +35,10 @@ build/cutlass_gemm: cutlass_gemm.cu
 	mkdir -p build
 	nvcc $< $(FLAGS) -o $@
 
+build/gather_gemm: gather_gemm.cu
+	mkdir -p build
+	nvcc $< $(FLAGS) -o $@
+
 build/fp8_bug: fp8_bug.cu
 	mkdir -p build
 	nvcc $< $(FLAGS) -o $@

@@ -11,168 +11,11 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
-namespace cutlass {
+#include "cute_dequant.cuh"
 
-using uint3b_t = integer_subbyte<3, false>;
-using uint5b_t = integer_subbyte<5, false>;
-
-template <typename T, int N, FloatRoundStyle Round>
-struct NumericArrayConverter<T, uint3b_t, N, Round> {
-  static_assert(N % 8 == 0);
-
-  using result_type = Array<T, N>;
-  using source_type = Array<uint3b_t, N>;
-
-  CUTLASS_HOST_DEVICE
-  static result_type convert(const source_type& source) {
-    result_type result;
-    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < N / 8; ++i) {
-      auto* s = s_base + i * 3;
-      result[i * 8] = T(s[0] & 0x07);
-      result[i * 8 + 1] = T((s[0] & 0x38) >> 3);
-      result[i * 8 + 2] = T((s[0] & 0xc0) >> 6) + T((s[1] & 0x01) << 2);
-      result[i * 8 + 3] = T((s[1] & 0x0e) >> 1);
-      result[i * 8 + 4] = T((s[1] & 0x70) >> 4);
-      result[i * 8 + 5] = T((s[1] & 0x80) >> 7) + T((s[2] & 0x03) << 1);
-      result[i * 8 + 6] = T((s[2] & 0x1c) >> 2);
-      result[i * 8 + 7] = T((s[2] & 0xe0) >> 5);
-    }
-    return result;
-  }
-
-  CUTLASS_HOST_DEVICE
-  result_type operator()(const source_type& s) const {
-    return convert(s);
-  }
-};
-
-template <typename T, int N, FloatRoundStyle Round>
-struct NumericArrayConverter<T, uint5b_t, N, Round> {
-  static_assert(N % 8 == 0);
-
-  using result_type = Array<T, N>;
-  using source_type = Array<uint5b_t, N>;
-
-  CUTLASS_HOST_DEVICE
-  static result_type convert(const source_type& source) {
-    result_type result;
-    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < N / 8; ++i) {
-      auto* s = s_base + i * 5;
-      result[i * 8] = T(s[0] & 0x1f);
-      result[i * 8 + 1] = T((s[0] & 0xe0) >> 5) + T((s[1] & 0x03) << 3);
-      result[i * 8 + 2] = T((s[1] & 0x7c) >> 2);
-      result[i * 8 + 3] = T((s[1] & 0x80) >> 7) + T((s[2] & 0x0f) << 1);
-      result[i * 8 + 4] = T((s[2] & 0xf0) >> 4) + T((s[3] & 0x01) << 4);
-      result[i * 8 + 5] = T((s[3] & 0x3e) >> 1);
-      result[i * 8 + 6] = T((s[3] & 0xc0) >> 6) + T((s[4] & 0x07) << 2);
-      result[i * 8 + 7] = T((s[4] & 0xf8) >> 3);
-    }
-    return result;
-  }
-
-  CUTLASS_HOST_DEVICE
-  result_type operator()(const source_type& s) const {
-    return convert(s);
-  }
-};
-
-template <typename T, int N, FloatRoundStyle Round>
-struct NumericArrayConverter<T, uint6b_t, N, Round> {
-  static_assert(N % 4 == 0);
-
-  using result_type = Array<T, N>;
-  using source_type = Array<uint6b_t, N>;
-
-  CUTLASS_HOST_DEVICE
-  static result_type convert(const source_type& source) {
-    result_type result;
-    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < N / 4; ++i) {
-      auto* s = s_base + i * 3;
-      result[i * 4] = T(s[0] & 0x3f);
-      result[i * 4 + 1] = T((s[0] >> 6) & 0x03) + T((s[1] & 0x0f) << 2);
-      result[i * 4 + 2] = T((s[1] >> 4) & 0x0f) + T((s[2] & 0x03) << 4);
-      result[i * 4 + 3] = T((s[2] >> 2) & 0x3f);
-    }
-    return result;
-  }
-
-  CUTLASS_HOST_DEVICE
-  result_type operator()(const source_type& s) const {
-    return convert(s);
-  }
-};
-
-} // namespace cutlass
-
-namespace cute {
-
-// Required by tiled copy for 3/5/6-bit weights.
-struct uint24_t {
-  std::array<std::uint8_t, 3> bytes;
-};
-struct uint40_t {
-  std::array<std::uint8_t, 5> bytes;
-};
-struct uint48_t {
-  std::array<std::uint8_t, 6> bytes;
-};
-
-template <>
-struct uint_bit<24> {
-  using type = uint24_t;
-};
-template <>
-struct uint_bit<40> {
-  using type = uint40_t;
-};
-template <>
-struct uint_bit<48> {
-  using type = uint48_t;
-};
-
-} // namespace cute
-
-namespace cute_gemm {
+namespace cutlass_gemm {
 
 using namespace cute;
-
-template <typename Quant>
-constexpr bool has_bias_v = !cutlass::has_negative_zero_v<Quant>;
-
-template <typename Element, typename SmemLayoutA, typename SmemLayoutB>
-struct SharedStorage {
-  ArrayEngine<Element, cosize_v<SmemLayoutA>> A;
-  ArrayEngine<Element, cosize_v<SmemLayoutB>> B;
-};
-
-__device__ __forceinline__ void
-cute_vectorized_dequant(auto w, auto s, auto z, auto out) {
-  using Element = typename decltype(out)::value_type;
-  using Quant = typename decltype(w)::value_type;
-  // Scale must be one element.
-  CUTE_STATIC_ASSERT_V(cosize(s.layout()) == Int<1>{});
-  CUTE_STATIC_ASSERT_V(cosize(z.layout()) == Int<1>{});
-  // Quant must be contiguous.
-  auto layout = coalesce(w.layout());
-  CUTE_STATIC_ASSERT_V(stride(layout) == Int<1>{});
-  // Use cutlass for conversions.
-  constexpr int N = size(layout);
-  auto& w_vec = *(reinterpret_cast<const cutlass::Array<Quant, N>*>(raw_pointer_cast(w.data())));
-  Element scale{s[0]};
-  cutlass::NumericArrayConverter<Element, Quant, N> converter;
-  auto w_dq = converter(w_vec) * scale;
-  if constexpr (has_bias_v<Quant>) {
-    Element zero_point{z[0]};
-    w_dq = w_dq + zero_point;
-  }
-  copy(make_tensor(make_rmem_ptr<Element>(&w_dq), out.layout()), out);
-}
 
 __device__ __forceinline__ void
 cute_naive_dequant(auto w, auto s, auto z, auto out) {
@@ -181,7 +24,7 @@ cute_naive_dequant(auto w, auto s, auto z, auto out) {
   using Scale = typename decltype(s)::value_type;
   transform(w, out, [](Quant q) { return Element(q); } );
   transform(out, s, out, [](Element e, Scale s) { return e * Element(s); });
-  if constexpr (has_bias_v<Quant>) {
+  if constexpr (quant_has_bias_v<Quant>) {
     transform(out, z, out, plus{});
   }
 }
@@ -196,72 +39,92 @@ cute_dequant(auto w, auto s, auto z, auto out) {
   }
 }
 
-template <bool HasKResidue, typename ProblemShape, typename CtaTiler,
-          typename Element, typename Quant, typename Scale,
-          typename StrideA, typename SmemLayoutA, typename TiledCopyA,
-          typename StrideB, typename SmemLayoutB, typename TiledCopyB,
-          typename StrideC, typename LayoutS, typename TiledMma>
-__global__ void qmm_naive_kernel(
-    ProblemShape shape_MNKL, CtaTiler cta_tiler,
-    const Element* A, StrideA dA, SmemLayoutA sA_layout, TiledCopyA copy_a,
-    const Quant*   B, StrideB dB, SmemLayoutB sB_layout, TiledCopyB copy_b,
-          Element* C, StrideC dC,
-    const Scale* S, const Element* Z, LayoutS S_layout,
-    TiledMma mma) {
-  CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));
-  CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));
-  CUTE_STATIC_ASSERT_V(congruent(select<0,2,3>(shape_MNKL), dA));
-  CUTE_STATIC_ASSERT_V(congruent(select<1,2,3>(shape_MNKL), dB));
-  CUTE_STATIC_ASSERT_V(congruent(select<0,1,3>(shape_MNKL), dC));
-
-  int thread_idx = int(threadIdx.x);
-  auto [m_coord, n_coord, l_coord] = static_cast<uint3>(blockIdx);
-
-  auto m_max_coord = size<0>(shape_MNKL) - size<0>(cta_tiler) * m_coord; // M - BLK_M * m_coord
-  auto n_max_coord = size<1>(shape_MNKL) - size<1>(cta_tiler) * n_coord; // N - BLK_N * n_coord
-
-  // Shift tensor so we handle residue of K in the 0th tile.
-  auto shape_K = size<2>(shape_MNKL);
-  auto bK = size<2>(cta_tiler);
-  auto k_residue = shape_K - bK * ceil_div(shape_K, bK);
-  if constexpr (HasKResidue) {
-    A += k_residue * get<1>(dA);
-    B += k_residue * get<1>(dB) * cuda::std::min(8, sizeof_bits_v<Quant>) / 8;
-    S += k_residue * stride<1>(S_layout);
-    Z += k_residue * stride<1>(S_layout);
+template <typename T, bool KMajor = true, bool HasKResidue = false>
+inline constexpr auto make_tiled_copy(auto num_threads, auto bM, auto bK) {
+  // TODO: Only do 1-element read for the tile of residue.
+  auto n_read = Int<HasKResidue ? 1 : 8>{};
+  auto atom = Copy_Atom<UniversalCopy<uint_bit_t<n_read * sizeof_bits_v<T>>>, T>{};
+  if constexpr (KMajor) {
+    auto k_threads = bK / n_read;
+    return make_tiled_copy(
+        atom,
+        make_layout(make_shape(Int<num_threads / k_threads>{}, k_threads), LayoutRight{}),
+        make_layout(make_shape(Int<1>{}, n_read)));
+  } else {
+    auto m_threads = bM / n_read;
+    return make_tiled_copy(
+        atom,
+        make_layout(make_shape(m_threads, Int<num_threads / m_threads>{}), LayoutLeft{}),
+        make_layout(make_shape(n_read, Int<1>{})));
   }
+}
 
-  // Represent the full tensors.
-  Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        select<0,2,3>(shape_MNKL), dA); // (M,K,L)
-  Tensor mB_nkl = make_tensor(make_gmem_ptr<Quant>(B), select<1,2,3>(shape_MNKL), dB); // (N,K,L)
-  Tensor mC_mnl = make_tensor(make_gmem_ptr(C),        select<0,1,3>(shape_MNKL), dC); // (M,N,L)
+template <bool KMajor = true>
+inline constexpr auto make_smem_layout(auto bM, auto bK) {
+  // TODO: Calculate swizzle based on tile shape.
+  if constexpr (KMajor) {
+    auto swizzle = composition(Swizzle<3,3,3>{},
+                               Layout<Shape <_8,Shape <_8, _8>>,
+                                      Stride<_8,Stride<_1,_64>>>{});
+    return tile_to_shape(swizzle, make_shape(bM, bK));
+  } else {
+    auto swizzle = composition(Swizzle<3,3,3>{},
+                               Layout<Shape<_64,_1>, Stride<_1,_64>>{});
+    return tile_to_shape(swizzle, make_shape(bM, bK));
+  }
+}
 
-  Tensor mS_nkl = make_tensor(make_gmem_ptr(S), S_layout); // (N,(group_size,K/group_size),L)
-  Tensor mZ_nkl = make_tensor(make_gmem_ptr(Z), S_layout); // (N,(group_size,K/group_size),L)
+template <bool KMajor, bool HasKResidue, bool SM80,
+          typename CtaTiler,
+          typename TensorA,
+          typename TensorB,
+          typename TensorS,
+          typename TensorZ,
+          typename TensorC,
+          typename TiledMma>
+CUTE_DEVICE void qmm_naive_mainloop(
+    CtaTiler cta_tiler,
+    TensorA gA,
+    TensorB gB,
+    TensorS gS,
+    TensorZ gZ,
+    TensorC gC,
+    TiledMma mma,
+    int m_max_coord,
+    int n_max_coord,
+    int k_residue,
+    int thread_idx) {
+  // Get the types of operands.
+  using Element = decltype(gA)::value_type;
+  using Quant = decltype(gB)::value_type;
 
-  // Get batch slice.
-  Tensor mA = mA_mkl(_,_,l_coord); // (M,K)
-  Tensor mB = mB_nkl(_,_,l_coord); // (N,K)
-  Tensor mC = mC_mnl(_,_,l_coord); // (M,N)
+  // Define copy atoms.
+  auto [bM, bN, bK] = cta_tiler;
+  auto num_threads = size(mma);
+  TiledCopy copy_a = make_tiled_copy<Element, true, HasKResidue>(num_threads, bM, bK);
+  TiledCopy copy_b = make_tiled_copy<Quant, KMajor>(num_threads, bN, bK);
 
-  Tensor mS = mS_nkl(_,_,l_coord); // (N,(group_size,K/group_size))
-  Tensor mZ = mZ_nkl(_,_,l_coord); // (N,(group_size,K/group_size))
+  // Define the A/B smem layouts (static).
+  auto sA_layout = make_smem_layout(bM, bK);
+  auto sB_layout = make_smem_layout<KMajor>(bN, bK);
 
-  // Get the appropriate blocks for this thread block.
-  auto cta_coord = make_coord(m_coord, n_coord, _); // (m,n,k)
-  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
-  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
-  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_N)
-
-  Tensor gS = local_tile(mS, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
-  Tensor gZ = local_tile(mZ, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
-
-  // Shared memory buffers.
-  extern __shared__ char shared_memory[];
-  using SharedStorage = SharedStorage<Element, SmemLayoutA, SmemLayoutB>;
-  SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
+  // Shared memory buffer.
+  __shared__ struct {
+    ArrayEngine<Element, cosize_v<decltype(sA_layout)>> A;
+    ArrayEngine<Element, cosize_v<decltype(sB_layout)>> B;
+  } smem;
   Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), sA_layout); // (BLK_M,BLK_K)
   Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), sB_layout); // (BLK_N,BLK_K)
+
+  // Shift tensor so we handle residue of K in the 0th tile.
+  gA = domain_offset(make_coord(0, k_residue, 0), gA);
+  if constexpr (sizeof_bits_v<Quant> % 8 == 0) {
+    gB = domain_offset(make_coord(0, k_residue, 0), gB);
+  } else {
+    gB.data() = recast_ptr<Quant>(raw_pointer_cast(gB.data()) + gB.layout()(0, k_residue, 0) * cuda::std::min(8, sizeof_bits_v<Quant>) / 8);
+  }
+  gS = domain_offset(make_coord(0, k_residue, 0), gS);
+  gZ = domain_offset(make_coord(0, k_residue, 0), gZ);
 
   // Partition the copying of A/B/C tiles across the threads.
   ThrCopy thr_copy_a = copy_a.get_slice(thread_idx);
@@ -394,23 +257,29 @@ inline constexpr auto make_matrix_stride(auto m, auto k) {
   }
 }
 
-template <bool KMajor = true>
-inline constexpr auto make_smem_layout(auto bM, auto bK) {
-  // TODO: Calculate swizzle based on tile shape.
+template <bool KMajor>
+inline constexpr auto make_scales_layout(auto n, auto k, auto l, auto group_size) {
   if constexpr (KMajor) {
-    auto swizzle = composition(Swizzle<3,3,3>{},
-                               Layout<Shape <_8,Shape <_8, _8>>,
-                                      Stride<_8,Stride<_1,_64>>>{});
-    return tile_to_shape(swizzle, make_shape(bM, bK));
+    return make_layout(
+        make_shape(n, make_shape(group_size, k / group_size), l),
+        make_stride(k / group_size, Stride<_0,_1>{}, n * k / group_size));
   } else {
-    auto swizzle = composition(Swizzle<3,3,3>{},
-                               Layout<Shape<_64,_1>, Stride<_1,_64>>{});
-    return tile_to_shape(swizzle, make_shape(bM, bK));
+    return make_layout(
+        make_shape(make_shape(group_size, n / group_size), k, l),
+        make_stride(Stride<_0,_1>{}, n / group_size, n * k / group_size));
   }
 }
 
-template <int TileM, bool SM80, typename Element>
-inline constexpr auto make_tiled_mma() {
+template <int TileM, bool SM80>
+inline constexpr auto make_cta_tiler(auto group_size) {
+  auto bM = Int<TileM>{};
+  auto bN = Int<(!SM80 && group_size > 64) ? 64 : 128>{};
+  auto bK = Int<max(64, group_size)>{};
+  return make_shape(bM, bN, bK);
+}
+
+template <bool SM80, typename Element>
+inline constexpr auto make_tiled_mma(auto cta_tiler) {
   using Atom = std::conditional_t<
       SM80,
       std::conditional_t<
@@ -426,7 +295,7 @@ inline constexpr auto make_tiled_mma() {
   if constexpr (!SM80 || std::is_same_v<Element, float>) {
     return make_tiled_mma(Atom{}, Layout<Shape<_16,_8,_1>>{});
   } else {
-    if constexpr (TileM >= 32) {
+    if constexpr (size<0>(cta_tiler) >= 32) {
       return make_tiled_mma(Atom{}, Layout<Shape<_2,_2,_1>>{}, Tile<_32,_32,_16>{});
     } else {
       return make_tiled_mma(Atom{}, Layout<Shape<_1,_4,_1>>{}, Tile<_16,_32,_16>{});
@@ -434,60 +303,100 @@ inline constexpr auto make_tiled_mma() {
   }
 }
 
-template <typename T, bool KMajor = true, bool HasKResidue = false>
-inline auto make_tiled_copy(auto num_threads, auto bM, auto bK) {
-  // TODO: Only do 1-element read for the tile of residue.
-  auto n_read = Int<HasKResidue ? 1 : 8>{};
-  auto atom = Copy_Atom<UniversalCopy<uint_bit_t<n_read * sizeof_bits_v<T>>>, T>{};
-  if constexpr (KMajor) {
-    auto k_threads = bK / n_read;
-    return make_tiled_copy(
-        atom,
-        make_layout(make_shape(Int<num_threads / k_threads>{}, k_threads), LayoutRight{}),
-        make_layout(make_shape(Int<1>{}, n_read)));
-  } else {
-    auto m_threads = bM / n_read;
-    return make_tiled_copy(
-        atom,
-        make_layout(make_shape(m_threads, Int<num_threads / m_threads>{}), LayoutLeft{}),
-        make_layout(make_shape(n_read, Int<1>{})));
-  }
+template <bool KMajor, bool HasKResidue, bool SM80,
+          typename Element, typename Quant, typename Scale,
+          typename ProblemShape,
+          typename CtaTiler,
+          typename StrideA,
+          typename StrideB,
+          typename LayoutS,
+          typename StrideC,
+          typename TiledMma>
+__global__
+__launch_bounds__(decltype(size(TiledMma{}))::value)
+void qmm_naive_kernel(
+    ProblemShape shape_MNKL,
+    CtaTiler cta_tiler,
+    const Element* A, StrideA dA,
+    const Quant* B, StrideB dB,
+    const Scale* S, const Element* Z, LayoutS S_layout,
+    const uint32_t* lhs_indices, const uint32_t* rhs_indices,
+    Element* C, StrideC dC,
+    TiledMma mma) {
+  CUTE_STATIC_ASSERT_V(congruent(select<0,2,3>(shape_MNKL), dA));
+  CUTE_STATIC_ASSERT_V(congruent(select<1,2,3>(shape_MNKL), dB));
+  CUTE_STATIC_ASSERT_V(congruent(select<0,1,3>(shape_MNKL), dC));
+
+  int thread_idx = int(threadIdx.x);
+  auto [m_coord, n_coord, l_coord] = static_cast<uint3>(blockIdx);
+
+  // Represent the full tensors.
+  Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        select<0,2,3>(shape_MNKL), dA); // (M,K,L)
+  Tensor mB_nkl = make_tensor(make_gmem_ptr<Quant>(B), select<1,2,3>(shape_MNKL), dB); // (N,K,L)
+  Tensor mC_mnl = make_tensor(make_gmem_ptr(C),        select<0,1,3>(shape_MNKL), dC); // (M,N,L)
+
+  Tensor mS_nkl = make_tensor(make_gmem_ptr(S), S_layout); // (N,(group_size,K/group_size),L)
+  Tensor mZ_nkl = make_tensor(make_gmem_ptr(Z), S_layout); // (N,(group_size,K/group_size),L)
+
+  // For gather, use index lookup for input batch slicing.
+  uint32_t a_batch = lhs_indices ? lhs_indices[l_coord] : l_coord;
+  uint32_t b_batch = rhs_indices ? rhs_indices[l_coord] : l_coord;
+
+  // Get batch slice.
+  Tensor mA = mA_mkl(_,_,a_batch); // (M,K)
+  Tensor mB = mB_nkl(_,_,b_batch); // (N,K)
+  Tensor mC = mC_mnl(_,_,l_coord); // (M,N)
+
+  Tensor mS = mS_nkl(_,_,b_batch); // (N,(group_size,K/group_size))
+  Tensor mZ = mZ_nkl(_,_,b_batch); // (N,(group_size,K/group_size))
+
+  // Get the appropriate blocks for this thread block.
+  auto cta_coord = make_coord(m_coord, n_coord, _); // (m,n,k)
+  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_N)
+
+  Tensor gS = local_tile(mS, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+  Tensor gZ = local_tile(mZ, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+
+  // Compute tile residues for predication.
+  int m_max_coord = size<0>(shape_MNKL) - size<0>(cta_tiler) * m_coord; // M - BLK_M * m_coord
+  int n_max_coord = size<1>(shape_MNKL) - size<1>(cta_tiler) * n_coord; // N - BLK_N * n_coord
+  int k_residue = size<2>(shape_MNKL) - size<1>(gA) * size<2>(gA);
+
+  qmm_naive_mainloop<KMajor, HasKResidue, SM80>(
+      cta_tiler,
+      gA,
+      gB,
+      gS,
+      gZ,
+      gC,
+      mma,
+      m_max_coord, n_max_coord, k_residue,
+      thread_idx);
 }
 
-template <bool KMajor>
-inline constexpr auto make_scales_layout(auto n, auto k, auto l, auto group_size) {
-  if constexpr (KMajor) {
-    return make_layout(
-        make_shape(n, make_shape(group_size, k / group_size), l),
-        make_stride(k / group_size, Stride<_0,_1>{}, n * k / group_size));
-  } else {
-    return make_layout(
-        make_shape(make_shape(group_size, n / group_size), k, l),
-        make_stride(Stride<_0,_1>{}, n / group_size, n * k / group_size));
-  }
-}
-
-template <int TileM = 16, bool KMajor = true, bool SM80 = true, bool HasKResidue = false,
+template <int TileM, bool KMajor, bool HasKResidue, bool SM80,
           typename Element, typename Quant, typename Scale>
 void qmm_naive(
     const Element* A,
     const Quant*   B,
     const Scale*   S,
     const Element* Z,
+    const uint32_t* lhs_indices,
+    const uint32_t* rhs_indices,
     Element* C,
     int m, int n, int k, int l,
     bool broadcast_b,
     auto group_size,
     auto&& launch_kernel) {
   // Define shapes (dynamic).
-  auto prob_shape = make_shape(m, n, k, l); // (M,N,K,L)
+  auto shape_MNKL = make_shape(m, n, k, l); // (M,N,K,L)
 
-  // Define TN strides (mixed).
+  // Define layouts (mixed).
   auto dA = make_stride(k, Int<1>{}, m * k);  // (dM,dK,dL)
   auto dB = make_matrix_stride<KMajor>(n, k); // (dN,dK,dL)
   auto dC = make_stride(n, Int<1>{}, m * n);  // (dM,dN,dL)
-
-  // Define layout of scales/biases (mixed).
   auto S_layout = make_scales_layout<KMajor>(n, k, l, group_size);
 
   // Handle broadcasting.
@@ -496,49 +405,41 @@ void qmm_naive(
     get<2>(stride(S_layout)) = 0;
   }
 
-  // Define CTA tile sizes (static).
-  auto bM = Int<TileM>{};
-  auto bN = Int<(!SM80 && group_size > 64) ? 64 : 128>{};
-  auto bK = Int<max(64, group_size)>{};
-  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
+  // Define CTA tile size (static).
+  auto cta_tiler = make_cta_tiler<TileM, SM80>(group_size);
 
   // Define MMA.
-  TiledMMA mma = make_tiled_mma<TileM, SM80, Element>();
+  auto mma = make_tiled_mma<SM80, Element>(cta_tiler);
   auto num_threads = size(mma);
 
-  // Define the A/B smem layouts (static).
-  auto sA_layout = make_smem_layout(bM, bK);
-  auto sB_layout = make_smem_layout<KMajor>(bN, bK);
-
-  // Atoms.
-  TiledCopy copy_a = make_tiled_copy<Element, true, HasKResidue>(num_threads, bM, bK);
-  TiledCopy copy_b = make_tiled_copy<Quant, KMajor>(num_threads, bN, bK);
-
   auto* kernel = &qmm_naive_kernel<
-      HasKResidue, decltype(prob_shape), decltype(cta_tiler),
+      KMajor, HasKResidue, SM80,
       Element, Quant, Scale,
-      decltype(dA), decltype(sA_layout), decltype(copy_a),
-      decltype(dB), decltype(sB_layout), decltype(copy_b),
-      decltype(dC), decltype(S_layout), decltype(mma)>;
+      decltype(shape_MNKL),
+      decltype(cta_tiler),
+      decltype(dA),
+      decltype(dB),
+      decltype(S_layout),
+      decltype(dC),
+      decltype(mma)>;
 
-  // Set L1 to be SMEM only.
-  size_t smem_bytes = sizeof(SharedStorage<Element, decltype(sA_layout), decltype(sB_layout)>);
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-  cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-
-  dim3 num_blocks(size(ceil_div(m, bM)), size(ceil_div(n, bN)), l);
-  dim3 block_dims(num_threads);
+  dim3 num_blocks{uint32_t(ceil_div(m, size<0>(cta_tiler))),
+                  uint32_t(ceil_div(n, size<1>(cta_tiler))),
+                  uint32_t(l)};
+  dim3 block_dims{num_threads};
   void* args[] = {
-      &prob_shape, &cta_tiler,
-      &A, &dA, &sA_layout, &copy_a,
-      &B, &dB, &sB_layout, &copy_b,
-      &C, &dC,
+      &shape_MNKL,
+      &cta_tiler,
+      &A, &dA,
+      &B, &dB,
       &S, &Z, &S_layout,
+      &lhs_indices, &rhs_indices,
+      &C, &dC,
       &mma};
-  launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, smem_bytes, args);
+  launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, args);
 }
 
-} // namespace cute_gemm
+} // namespace cutlass_gemm
 
 template <typename Element>
 void cublas_gemm(char transA, char transB,
@@ -602,11 +503,10 @@ void cutlass_gemm_tt(int m, int n, int k, int l,
   CUTE_CHECK_LAST();
 }
 
-void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, size_t smem_bytes, void** args) {
+void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, void** args) {
   cudaLaunchConfig_t config = {};
   config.gridDim = num_blocks;
   config.blockDim = block_dims;
-  config.dynamicSmemBytes = smem_bytes;
   config.stream = nullptr;
   cudaLaunchKernelExC(&config, func, args);
 }
@@ -638,7 +538,7 @@ int main(int argc, char** argv) {
   CUTE_CHECK_ERROR(cudaGetDeviceProperties(&device_prop, 0));
 
   using Element = cutlass::half_t;
-  using Quant = cutlass::uint2b_t;
+  using Quant = cutlass::uint6b_t;
   constexpr int TileM = 16;
   constexpr bool SM80 = true;
   constexpr bool KMajor = false;
@@ -660,7 +560,7 @@ int main(int argc, char** argv) {
       d_B.data().get(), d_B.size(), seed, Quant(0), Quant(6));
   cutlass::reference::device::BlockFillRandomUniform(
       d_S.data().get(), d_S.size(), seed, Element(0.1f), Element(-0.1f));
-  if constexpr (cute_gemm::has_bias_v<Quant>) {
+  if constexpr (cutlass_gemm::quant_has_bias_v<Quant>) {
     cutlass::reference::device::BlockFillRandomUniform(
         d_Z.data().get(), d_Z.size(), seed, Element(0.1f), Element(-0.1f));
   } else {
@@ -705,11 +605,13 @@ int main(int argc, char** argv) {
       stream);
 
   // Run once
-  cute_gemm::qmm_naive<TileM, KMajor, SM80, HasKResidue>(
+  cutlass_gemm::qmm_naive<TileM, KMajor, HasKResidue, SM80>(
       d_A.data().get(),
       d_B.data().get(),
       d_S.data().get(),
       d_Z.data().get(),
+      nullptr,
+      nullptr,
       d_D.data().get(),
       m, n, k, l,
       false,
@@ -760,11 +662,13 @@ int main(int argc, char** argv) {
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cute_gemm::qmm_naive<TileM, KMajor, SM80, HasKResidue>(
+    cutlass_gemm::qmm_naive<TileM, KMajor, HasKResidue, SM80>(
         d_A.data().get(),
         d_B.data().get(),
         d_S.data().get(),
         d_Z.data().get(),
+        nullptr,
+        nullptr,
         d_D.data().get(),
         m, n, k, l,
         false,

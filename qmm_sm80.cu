@@ -8,106 +8,79 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
-namespace cute_gemm {
+#include "cute_dequant.cuh"
+
+namespace cutlass_gemm {
 
 using namespace cute;
 
-template <typename Quant>
-constexpr bool has_bias_v = !cutlass::has_negative_zero_v<Quant>;
-
-template <typename Element,
-          typename Quant,
-          typename SmemLayoutA,
-          typename SmemLayoutB,
-          typename SmemLayoutC>
-union SharedStorage {
-  struct {
-    ArrayEngine<Element, cosize_v<SmemLayoutA>> A;
-    ArrayEngine<Quant,   cosize_v<SmemLayoutB>> B;
-  } mainloop;
-  struct {
-    ArrayEngine<Element, cosize_v<SmemLayoutC>> C;
-  } epilogue;
-};
-
-template <typename Q, typename S, typename Z, typename T>
-__device__ __forceinline__ void
-dequant(const Q& w, const S& s, const Z& z, T out) {
-  // Scale must be one element.
-  CUTE_STATIC_ASSERT_V(cosize(s.layout()) == Int<1>{});
-  CUTE_STATIC_ASSERT_V(cosize(z.layout()) == Int<1>{});
-  // Quant must be contiguous.
-  auto layout = coalesce(w.layout());
-  CUTE_STATIC_ASSERT_V(stride(layout) == Int<1>{});
-  // Use cutlass for conversions.
-  constexpr int N = size(layout);
-  using Element = typename T::value_type;
-  using Quant = typename Q::value_type;
-  auto& w_vec = *(reinterpret_cast<const cutlass::Array<Quant, N>*>(raw_pointer_cast(w.data())));
-  Element scale{s[0]};
-  cutlass::NumericArrayConverter<Element, Quant, N> converter;
-  auto w_dq = converter(w_vec) * scale;
-  if constexpr (has_bias_v<Quant>) {
-    Element zero_point{z[0]};
-    w_dq = w_dq + zero_point;
-  }
-  copy(make_tensor(make_rmem_ptr<Element>(&w_dq), out.layout()), out);
+template <typename T, int bits, template <typename U> typename Atom>
+inline constexpr auto make_tiled_copy(auto num_threads) {
+  return make_tiled_copy(
+      Copy_Atom<Atom<uint_bit_t<bits>>, T>{},
+      make_layout(make_shape(Int<num_threads / 8>{}, Int<8>{}), LayoutRight{}),
+      make_layout(make_shape(Int<1>{}, Int<bits / sizeof_bits_v<T>>{})));
 }
 
-template <typename ProblemShape, typename CtaTiler,
-          typename Element, typename Quant, typename Scale,
-          typename StrideA, typename SmemLayoutA, typename TiledCopyA, typename S2RAtomA,
-          typename StrideB, typename SmemLayoutB, typename TiledCopyB, typename S2RAtomB,
-          typename StrideC, typename SmemLayoutC, typename TiledCopyC, typename R2SAtomC,
-          typename LayoutS, typename G2RAtomS, typename TiledMma>
-__global__ void qmm_sm80_kernel(
-    ProblemShape shape_MNKL, CtaTiler cta_tiler,
-    const Element* A, StrideA dA, SmemLayoutA sA_layout, TiledCopyA g2s_copy_a, S2RAtomA s2r_atom_a,
-    const Quant*   B, StrideB dB, SmemLayoutB sB_layout, TiledCopyB g2s_copy_b, S2RAtomB s2r_atom_b,
-          Element* C, StrideC dC, SmemLayoutC sC_layout, TiledCopyC s2g_copy_c, R2SAtomC r2s_atom_c,
-    const Scale* S, const Element* Z, LayoutS S_layout, G2RAtomS g2r_atom_s, TiledMma mma) {
-  CUTE_STATIC_ASSERT_V(size(g2s_copy_a) == size(mma));
-  CUTE_STATIC_ASSERT_V(size(g2s_copy_b) == size(mma));
-  CUTE_STATIC_ASSERT_V(size(s2g_copy_c) == size(mma));
-  CUTE_STATIC_ASSERT_V(congruent(select<0,2,3>(shape_MNKL), dA));
-  CUTE_STATIC_ASSERT_V(congruent(select<1,2,3>(shape_MNKL), dB));
-  CUTE_STATIC_ASSERT_V(congruent(select<0,1,3>(shape_MNKL), dC));
+template <typename CtaTiler,
+          typename TensorA,
+          typename TensorB,
+          typename TensorS,
+          typename TensorZ,
+          typename TensorC,
+          typename TiledMma>
+CUTE_DEVICE void qmm_sm80_mainloop(
+    CtaTiler cta_tiler,
+    TensorA gA,
+    TensorB gB,
+    TensorS gS,
+    TensorZ gZ,
+    TensorC gC,
+    TiledMma mma,
+    int m_max_coord,
+    int thread_idx) {
+  // Get the types of operands.
+  using Element = decltype(gA)::value_type;
+  using Quant = decltype(gB)::value_type;
+  using Scale = decltype(gS)::value_type;
 
-  int thread_idx = int(threadIdx.x);
-  auto [m_coord, n_coord, l_coord] = static_cast<uint3>(blockIdx);
+  // Define the A/B smem layouts (static).
+  auto swizzle_ab = composition(Swizzle<3,3,3>{},
+                                Layout<Shape <_8,Shape <_8, _8>>,
+                                       Stride<_8,Stride<_1,_64>>>{});
+  auto [bM, bN, bK] = cta_tiler;
+  auto bP = Int<3>{}; // pipeline
+  auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM, bK, bP));
+  auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN, bK, bP));
 
-  // Represent the full tensors.
-  Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        select<0,2,3>(shape_MNKL), dA); // (M,K,L)
-  Tensor mB_nkl = make_tensor(make_gmem_ptr<Quant>(B), select<1,2,3>(shape_MNKL), dB); // (N,K,L)
-  Tensor mC_mnl = make_tensor(make_gmem_ptr(C),        select<0,1,3>(shape_MNKL), dC); // (M,N,L)
+  // Define the C smem layouts (static).
+  // TODO: Find a better swizzle.
+  auto sC_layout = tile_to_shape(swizzle_ab, make_shape(bM, bN));
 
-  Tensor mS_nkl = make_tensor(make_gmem_ptr(S), S_layout); // (N,(group_size,K/group_size),L)
-  Tensor mZ_nkl = make_tensor(make_gmem_ptr(Z), S_layout); // (N,(group_size,K/group_size),L)
+  // Define copy atoms.
+  constexpr int element_bits = sizeof_bits_v<Element>;
+  constexpr int quant_bits = sizeof_bits_v<Quant>;
+  constexpr int qload = 128 / (element_bits / quant_bits);
+  auto num_threads = size(mma);
+  TiledCopy g2s_copy_a = make_tiled_copy<Element, 128, SM80_CP_ASYNC_CACHEALWAYS>(num_threads);
+  TiledCopy g2s_copy_b = make_tiled_copy<Quant, qload, SM80_CP_ASYNC_CACHEALWAYS>(num_threads);
+  TiledCopy s2g_copy_c = make_tiled_copy<Element, 128, UniversalCopy>(num_threads);
 
-  // Get batch slice.
-  Tensor mA = mA_mkl(_,_,l_coord); // (M,K)
-  Tensor mB = mB_nkl(_,_,l_coord); // (N,K)
-  Tensor mC = mC_mnl(_,_,l_coord); // (M,N)
-
-  Tensor mS = mS_nkl(_,_,l_coord); // (N,(group_size,K/group_size))
-  Tensor mZ = mZ_nkl(_,_,l_coord); // (N,(group_size,K/group_size))
-
-  // Get the appropriate blocks for this thread block.
-  auto cta_coord = make_coord(m_coord, n_coord, _); // (m,n,k)
-  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
-  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
-  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_N)
-
-  Tensor gS = local_tile(mS, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
-  Tensor gZ = local_tile(mZ, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+  Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
+  Copy_Atom<UniversalCopy<uint_bit_t<2 * quant_bits>>, Quant> s2r_atom_b;
+  Copy_Atom<UniversalCopy<uint_bit_t<2 * element_bits>>, Element> r2s_atom_c;
+  Copy_Atom<UniversalCopy<Scale>, Scale> g2r_atom_s;
 
   // Shared memory buffers.
-  extern __shared__ char shared_memory[];
-  using SharedStorage = SharedStorage<Element, Quant,
-                                      SmemLayoutA,
-                                      SmemLayoutB,
-                                      SmemLayoutC>;
-  SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
+  __shared__ union {
+    struct {
+      ArrayEngine<Element, cosize_v<decltype(sA_layout)>> A;
+      ArrayEngine<Quant,   cosize_v<decltype(sB_layout)>> B;
+    } mainloop;
+    struct {
+      ArrayEngine<Element, cosize_v<decltype(sC_layout)>> C;
+    } epilogue;
+  } smem;
   Tensor sA = make_tensor(make_smem_ptr(smem.mainloop.A.begin()), sA_layout); // (BLK_M,BLK_K)
   Tensor sB = make_tensor(make_smem_ptr(smem.mainloop.B.begin()), sB_layout); // (BLK_N,BLK_K)
   Tensor sC = make_tensor(make_smem_ptr(smem.epilogue.C.begin()), sC_layout); // (BLK_M,BLK_N)
@@ -164,7 +137,6 @@ __global__ void qmm_sm80_kernel(
   Tensor g2r_tCrZ = g2r_thr_copy_s.retile_D(tCrZ);  // (BCPY,MMA_N,MMA_K)
 
   // Predicates for m bound.
-  auto m_max_coord = size<0>(shape_MNKL) - size<0>(gA) * m_coord; // M - BLK_M * m_coord
   Tensor tApA = make_tensor<bool>(make_shape(size<1>(tAsA), size<2>(tAsA)), Stride<_1,_0>{});         // (CPY_M,CPY_K)
   Tensor tCpC = make_tensor<bool>(make_shape(size<1>(s2g_tCsC), size<2>(s2g_tCsC)), Stride<_1,_0>{}); // (CPY_M,CPY_N)
   Tensor cA = make_identity_tensor(make_shape(size<0>(sA), size<1>(sA))); // (BLK_M,BLK_K)
@@ -194,7 +166,7 @@ __global__ void qmm_sm80_kernel(
   // Copy S/Z: GMEM => RMEM.
   auto fetch_scales = [&](int tile) {
     copy(g2r_copy_s, g2r_tCgS(_,_,_,tile), g2r_tCrS);
-    if constexpr (has_bias_v<Quant>) {
+    if constexpr (quant_has_bias_v<Quant>) {
       copy(g2r_copy_s, g2r_tCgZ(_,_,_,tile), g2r_tCrZ);
     }
   };
@@ -204,7 +176,11 @@ __global__ void qmm_sm80_kernel(
     copy(s2r_atom_b, s2r_tCsB(_,_,block,smem_pipe_read), s2r_tCrB(_,_,block));
     CUTE_UNROLL
     for (int n = 0; n < size<1>(tCrB); ++n) {
-      dequant(tCrB(_,n,block), tCrS(_,n,block), tCrZ(_,n,block), tCrB_dq(_,n,block));
+      cute_vectorized_dequant(
+          tCrB(_,n,block),
+          tCrS(_,n,block),
+          tCrZ(_,n,block),
+          tCrB_dq(_,n,block));
     }
   };
 
@@ -212,8 +188,8 @@ __global__ void qmm_sm80_kernel(
   auto K_BLOCK_MAX = size<2>(tCrA);
 
   // Prefetch beginning tiles.
-  CUTE_UNROLL
   int tile_pipe = 0;
+  CUTE_UNROLL
   for (; tile_pipe < K_PIPE_MAX - 1; ++tile_pipe) {
     fetch_gmem(tile_pipe);
   }
@@ -263,125 +239,167 @@ __global__ void qmm_sm80_kernel(
   copy_if(s2g_copy_c, tCpC, s2g_tCsC, s2g_tCgC);
 }
 
-template <typename Element>
-inline constexpr auto make_mma_atom() {
-  if constexpr (std::is_same_v<Element, half_t>) {
-    return SM80_16x8x16_F32F16F16F32_TN{};
-  }
-  if constexpr (std::is_same_v<Element, bfloat16_t>) {
-    return SM80_16x8x16_F32BF16BF16F32_TN{};
-  }
+inline constexpr auto make_scales_layout(auto n, auto k, auto l, auto group_size) {
+  return make_layout(
+      make_shape(n, make_shape(group_size, k / group_size), l),
+      make_stride(k / group_size, Stride<_0,_1>{}, n * k / group_size));
+}
+
+template <int TileM>
+inline constexpr auto make_cta_tiler(auto group_size) {
+  auto bM = Int<TileM>{};
+  auto bN = Int<128>{};
+  auto bK = Int<max(64, group_size)>{};
+  return make_shape(bM, bN, bK);
 }
 
 template <int TileM, typename Element>
 inline constexpr auto make_tiled_mma() {
-  constexpr auto atom = make_mma_atom<Element>();
+  using Atom = std::conditional_t<
+      std::is_same_v<Element, half_t>,
+      SM80_16x8x16_F32F16F16F32_TN,
+      std::conditional_t<
+          std::is_same_v<Element, bfloat16_t>,
+          SM80_16x8x16_F32BF16BF16F32_TN,
+          UniversalFMA<float>>>;
   if constexpr (TileM >= 32) {
-    return make_tiled_mma(atom, Layout<Shape<_2,_2,_1>>{}, Tile<_32,_32,_16>{});
+    return make_tiled_mma(Atom{}, Layout<Shape<_2,_2,_1>>{}, Tile<_32,_32,_16>{});
   } else {
-    return make_tiled_mma(atom, Layout<Shape<_1,_4,_1>>{}, Tile<_16,_32,_16>{});
+    return make_tiled_mma(Atom{}, Layout<Shape<_1,_4,_1>>{}, Tile<_16,_32,_16>{});
   }
 }
 
-template <typename T, int bits, template <typename U> typename Atom, typename NumThreads>
-inline auto make_tiled_copy(NumThreads num_threads) {
-  return make_tiled_copy(
-      Copy_Atom<Atom<uint_bit_t<bits>>, T>{},
-      make_layout(make_shape(Int<num_threads / 8>{}, Int<8>{}), LayoutRight{}),
-      make_layout(make_shape(Int<1>{}, Int<bits / sizeof_bits_v<T>>{})));
+template <typename Element, typename Quant, typename Scale,
+          typename ProblemShape,
+          typename CtaTiler,
+          typename StrideA,
+          typename StrideB,
+          typename LayoutS,
+          typename StrideC,
+          typename TiledMma>
+__global__
+__launch_bounds__(decltype(size(TiledMma{}))::value)
+void qmm_sm80_kernel(
+    ProblemShape shape_MNKL, CtaTiler cta_tiler,
+    const Element* A, StrideA dA,
+    const Quant* B, StrideB dB,
+    const Scale* S, const Element* Z, LayoutS S_layout,
+    const uint32_t* lhs_indices, const uint32_t* rhs_indices,
+    Element* C, StrideC dC,
+    TiledMma mma) {
+  CUTE_STATIC_ASSERT_V(congruent(select<0,2,3>(shape_MNKL), dA));
+  CUTE_STATIC_ASSERT_V(congruent(select<1,2,3>(shape_MNKL), dB));
+  CUTE_STATIC_ASSERT_V(congruent(select<0,1,3>(shape_MNKL), dC));
+
+  int thread_idx = int(threadIdx.x);
+  auto [m_coord, n_coord, l_coord] = static_cast<uint3>(blockIdx);
+
+  // For gather, use index lookup for input batch slicing.
+  uint32_t a_batch = lhs_indices ? lhs_indices[l_coord] : l_coord;
+  uint32_t b_batch = rhs_indices ? rhs_indices[l_coord] : l_coord;
+
+  // Represent the full tensors.
+  Tensor mA_mkl = make_tensor(make_gmem_ptr(A),        select<0,2,3>(shape_MNKL), dA); // (M,K,L)
+  Tensor mB_nkl = make_tensor(make_gmem_ptr<Quant>(B), select<1,2,3>(shape_MNKL), dB); // (N,K,L)
+  Tensor mC_mnl = make_tensor(make_gmem_ptr(C),        select<0,1,3>(shape_MNKL), dC); // (M,N,L)
+
+  Tensor mS_nkl = make_tensor(make_gmem_ptr(S), S_layout); // (N,(group_size,K/group_size),L)
+  Tensor mZ_nkl = make_tensor(make_gmem_ptr(Z), S_layout); // (N,(group_size,K/group_size),L)
+
+  // Get batch slice.
+  Tensor mA = mA_mkl(_,_,a_batch); // (M,K)
+  Tensor mB = mB_nkl(_,_,b_batch); // (N,K)
+  Tensor mC = mC_mnl(_,_,l_coord); // (M,N)
+
+  Tensor mS = mS_nkl(_,_,b_batch); // (N,(group_size,K/group_size))
+  Tensor mZ = mZ_nkl(_,_,b_batch); // (N,(group_size,K/group_size))
+
+  // Get the appropriate blocks for this thread block.
+  auto cta_coord = make_coord(m_coord, n_coord, _); // (m,n,k)
+  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_N)
+
+  Tensor gS = local_tile(mS, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+  Tensor gZ = local_tile(mZ, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+
+  // Compute tile residues for predication.
+  auto m_max_coord = size<0>(shape_MNKL) - size<0>(gA) * m_coord; // M - BLK_M * m_coord
+
+  qmm_sm80_mainloop(
+      cta_tiler,
+      gA,
+      gB,
+      gS,
+      gZ,
+      gC,
+      mma,
+      m_max_coord,
+      thread_idx);
 }
 
-template <int TileM = 16, typename Element, typename Quant, typename Scale, typename GroupSize, typename F>
+template <int TileM,
+          typename Element, typename Quant, typename Scale>
 void qmm_sm80(
     const Element* A,
     const Quant*   B,
     const Scale* S,
     const Element* Z,
+    const uint32_t* lhs_indices,
+    const uint32_t* rhs_indices,
     Element* C,
     int m, int n, int k, int l,
-    GroupSize group_size,
-    F&& launch_kernel) {
+    bool broadcast_b,
+    auto group_size,
+    auto&& launch_kernel) {
   // Define shapes (dynamic).
-  auto prob_shape = make_shape(m, n, k, l); // (M,N,K,L)
+  auto shape_MNKL = make_shape(m, n, k, l); // (M,N,K,L)
 
-  // Define TN strides (mixed).
+  // Define layouts (mixed).
   auto dA = make_stride(k, Int<1>{}, m * k); // (dM,dK,dL)
   auto dB = make_stride(k, Int<1>{}, n * k); // (dN,dK,dL)
   auto dC = make_stride(n, Int<1>{}, m * n); // (dM,dN,dL)
+  auto S_layout = make_scales_layout(n, k, l, group_size);
+
+  // Handle broadcasting.
+  if (broadcast_b) {
+    get<2>(dB) = 0;
+    get<2>(stride(S_layout)) = 0;
+  }
 
   // Define CTA tile sizes (static).
-  auto bM = Int<TileM>{};
-  auto bN = Int<128>{};
-  auto bK = Int<max(64, group_size)>{};
-  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
+  auto cta_tiler = make_cta_tiler<TileM>(group_size);
 
   // Define MMA.
   TiledMMA mma = make_tiled_mma<TileM, Element>();
   auto num_threads = size(mma);
 
-  // Define the A/B smem layouts (static).
-  auto swizzle_ab = composition(Swizzle<3,3,3>{},
-                                Layout<Shape <_8,Shape <_8, _8>>,
-                                       Stride<_8,Stride<_1,_64>>>{});
-  auto bP = Int<3>{}; // pipeline
-  auto sA_layout = tile_to_shape(swizzle_ab, make_shape(bM, bK, bP));
-  auto sB_layout = tile_to_shape(swizzle_ab, make_shape(bN, bK, bP));
-
-  // Define the C smem layouts (static).
-  // TODO: Find a better swizzle.
-  auto sC_layout = tile_to_shape(swizzle_ab, make_shape(bM, bN));
-
-  // Define the scales/biases smem layouts (static).
-  auto bS = ceil_div(bK, group_size);
-  auto sS_layout = make_layout(make_shape(bN, make_shape(group_size, bS)),
-                               make_stride(bS, Stride<_0, _1>{}));
-
-  // Define layout of scales/biases (mixed).
-  auto S_layout = make_layout(
-      make_shape(n, make_shape(group_size, k / group_size), l),
-      make_stride(k / group_size, Stride<_0, _1>{}, n * k / group_size));
-
-  // Atoms.
-  constexpr int element_bits = sizeof_bits_v<Element>;
-  constexpr int quant_bits = sizeof_bits_v<Quant>;
-  constexpr int qload = 128 / (element_bits / quant_bits);
-  TiledCopy g2s_copy_a = make_tiled_copy<Element, 128, SM80_CP_ASYNC_CACHEALWAYS>(num_threads);
-  TiledCopy g2s_copy_b = make_tiled_copy<Quant, qload, SM80_CP_ASYNC_CACHEALWAYS>(num_threads);
-  TiledCopy s2g_copy_c = make_tiled_copy<Element, 128, UniversalCopy>(num_threads);
-
-  Copy_Atom<SM75_U32x4_LDSM_N, Element> s2r_atom_a;
-  Copy_Atom<UniversalCopy<uint_bit_t<2 * quant_bits>>, Quant> s2r_atom_b;
-  Copy_Atom<UniversalCopy<uint_bit_t<2 * element_bits>>, Element> r2s_atom_c;
-  Copy_Atom<UniversalCopy<Scale>, Scale> g2r_atom_s;
-
   auto* kernel = &qmm_sm80_kernel<
-      decltype(prob_shape), decltype(cta_tiler),
       Element, Quant, Scale,
-      decltype(dA), decltype(sA_layout), decltype(g2s_copy_a), decltype(s2r_atom_a),
-      decltype(dB), decltype(sB_layout), decltype(g2s_copy_b), decltype(s2r_atom_b),
-      decltype(dC), decltype(sC_layout), decltype(s2g_copy_c), decltype(r2s_atom_c),
-      decltype(S_layout), decltype(g2r_atom_s), decltype(mma)>;
+      decltype(shape_MNKL),
+      decltype(cta_tiler),
+      decltype(dA),
+      decltype(dB),
+      decltype(S_layout),
+      decltype(dC),
+      decltype(mma)>;
 
-  // Set L1 to be SMEM only.
-  size_t smem_bytes = sizeof(SharedStorage<Element, Quant,
-                                           decltype(sA_layout),
-                                           decltype(sB_layout),
-                                           decltype(sC_layout)>);
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-  cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-
-  dim3 num_blocks(size(ceil_div(m, bM)), size(ceil_div(n, bN)), l);
-  dim3 block_dims(num_threads);
+  dim3 num_blocks{uint32_t(ceil_div(m, size<0>(cta_tiler))),
+                  uint32_t(ceil_div(n, size<1>(cta_tiler))),
+                  uint32_t(l)};
+  dim3 block_dims{num_threads};
   void* args[] = {
-      &prob_shape, &cta_tiler,
-      &A, &dA, &sA_layout, &g2s_copy_a, &s2r_atom_a,
-      &B, &dB, &sB_layout, &g2s_copy_b, &s2r_atom_b,
-      &C, &dC, &sC_layout, &s2g_copy_c, &r2s_atom_c,
-      &S, &Z, &S_layout, &g2r_atom_s, &mma};
-  launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, smem_bytes, args);
+      &shape_MNKL, &cta_tiler,
+      &A, &dA,
+      &B, &dB,
+      &S, &Z, &S_layout,
+      &lhs_indices, &rhs_indices,
+      &C, &dC,
+      &mma};
+  launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, args);
 }
 
-} // namespace cute_gemm
+} // namespace cutlass_gemm
 
 template <typename Element>
 void cublas_gemm(char transA, char transB,
@@ -433,11 +451,10 @@ void cublas_gemm(char transA, char transB,
   }
 }
 
-void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, size_t smem_bytes, void** args) {
+void launch_kernel(void* func, dim3 num_blocks, dim3 block_dims, void** args) {
   cudaLaunchConfig_t config = {};
   config.gridDim = num_blocks;
   config.blockDim = block_dims;
-  config.dynamicSmemBytes = smem_bytes;
   config.stream = nullptr;
   cudaLaunchKernelExC(&config, func, args);
 }
@@ -522,13 +539,16 @@ int main(int argc, char** argv) {
       stream);
 
   // Run once
-  cute_gemm::qmm_sm80<tile_m>(
+  cutlass_gemm::qmm_sm80<tile_m>(
       d_A.data().get(),
       d_B.data().get(),
       d_S.data().get(),
       d_Z.data().get(),
+      nullptr,
+      nullptr,
       d_D.data().get(),
       m, n, k, l,
+      false,
       Int<group_size>{},
       launch_kernel);
   CUTE_CHECK_LAST();
@@ -577,13 +597,16 @@ int main(int argc, char** argv) {
   GPU_Clock timer;
   timer.start();
   for (int i = 0; i < timing_iterations; ++i) {
-    cute_gemm::qmm_sm80<tile_m>(
+    cutlass_gemm::qmm_sm80<tile_m>(
         d_A.data().get(),
         d_B.data().get(),
         d_S.data().get(),
         d_Z.data().get(),
+        nullptr,
+        nullptr,
         d_D.data().get(),
         m, n, k, l,
+        false,
         Int<group_size>{},
         launch_kernel);
   }
